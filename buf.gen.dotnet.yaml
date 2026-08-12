@@ -1,0 +1,33 @@
+# sdk/dotnet/buf.gen.dotnet.yaml — C#-only codegen for the Probe SDK.
+#
+# Deliberately NOT the repo-root buf.gen.yaml: this runs only the C# plugin, sets clean: false
+# (so it never touches the committed .generated/dotnet/ tree), and roots csharp_namespace at THIS
+# module via managed mode so the model/probe namespaces resolve to Emet.Sentinel.Model.V1 and
+# Emet.Sentinel.Probe.V1.
+#
+# Output is sdk/dotnet/src/Sentinel.Probe.Sdk/gen. The generated C# is currently hand-checked-in
+# (see gen/README.md) because the codegen pipeline is not yet wired into CI; once it is, this
+# template regenerates gen/ from the locked protos and gen/ becomes gitignored like sdk/go/gen.
+#
+# S2 fix: Buf v2 uses `managed: enabled: true` with `override:` for namespace overrides. Using
+# `generated:` (a v1 field) would fail or silently ignore the csharp_namespace overrides.
+version: v2
+clean: false
+managed:
+  enabled: true
+  override:
+    - file_option: csharp_namespace
+      value: Emet.Sentinel.Model.V1
+      path: sentinel/model/v1
+    - file_option: csharp_namespace
+      value: Emet.Sentinel.Probe.V1
+      path: sentinel/probe/v1
+inputs:
+  - directory: proto
+plugins:
+  # Same pin as the repo-root buf.gen.yaml; the generated C# targets the
+  # Google.Protobuf 3.33.4 runtime pinned in the *.csproj.
+  - remote: buf.build/protocolbuffers/csharp:v33.4
+    revision: 1
+    out: sdk/dotnet/src/Sentinel.Probe.Sdk/gen
+    opt: base_namespace=Emet.Sentinel
