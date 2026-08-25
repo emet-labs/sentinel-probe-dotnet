@@ -33,11 +33,14 @@ regeneration path. `buf.gen.dotnet.yaml` uses the `managed:` mode (S2 fix), not
 ## Build and test
 
 ```
-dotnet build sdk/dotnet/Sentinel.Probe.Sdk.sln
-dotnet test  sdk/dotnet/Sentinel.Probe.Sdk.sln
+cd sdk/dotnet
+dotnet restore --locked-mode Sentinel.Probe.Sdk.sln
+dotnet build --no-restore Sentinel.Probe.Sdk.sln
+dotnet test --no-build --no-restore Sentinel.Probe.Sdk.sln
 ```
 
-Both pass on .NET 10.0.302 (pinned via `global.json`). The test suite uses xUnit,
+Run the commands from `sdk/dotnet` so SDK discovery uses its `global.json`. All three pass
+on .NET 10.0.302. The test suite uses xUnit,
 is hermetic (ADR-0019: no network, no wall clock at test-execution time), and
 covers 171 cases mirroring the Go `*_test.go` files.
 

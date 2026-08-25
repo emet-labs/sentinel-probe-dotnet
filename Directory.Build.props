@@ -8,9 +8,10 @@
 
     RestorePackagesWithLockFile (S2 fix): NuGet writes a packages.lock.json per project capturing
     the exact resolved graph. The lock files are committed (see each csproj's sibling
-    packages.lock.json), and the Justfile restores with the locked mode flag so a drifting
-    transitive is caught in CI exactly as Go's go.sum does. A plain dotnet build still restores
-    normally, so the lock is advisory unless the locked mode flag is passed.
+    packages.lock.json). The Justfile first runs `dotnet restore --locked-mode`, then makes every
+    build, test, and format consumer suppress its implicit restore. This makes a drifting
+    dependency fail before any consumer runs, exactly as Go's go.sum does. A raw `dotnet build`
+    still restores normally, so use the locked restore sequence documented in README.md.
   -->
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
