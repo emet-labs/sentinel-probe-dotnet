@@ -12,6 +12,8 @@ public class BudgetTests
         yield return new object[] { 10000L, 99999L, 0UL };
         yield return new object[] { 10000L, 0L, 10000UL };
         yield return new object[] { 0L, -5000L, 5000UL };
+        yield return new object[] { long.MinValue + 4, long.MaxValue - 5, 10UL };
+        yield return new object[] { long.MinValue, 0L, 0UL };
     }
 
     [Theory]
