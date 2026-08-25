@@ -52,6 +52,58 @@ public class ConformanceVectorsTests
     }
 
     [Fact]
+    public void SharedMalformedCorpusIsRejectedByCategory()
+    {
+        using var manifest = Load("manifest-v1.json");
+        foreach (var fixture in manifest.RootElement.GetProperty("malformed").EnumerateArray())
+        {
+            var path = fixture.GetProperty("path").GetString()!;
+            Assert.Equal(fixture.GetProperty("rejection_category").GetString(), MalformedCategory(path));
+        }
+    }
+
+    private static string MalformedCategory(string name)
+    {
+        using var document = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(Root, name)));
+        try
+        {
+            RejectDuplicateKeys(document.RootElement);
+        }
+        catch (Exception error) when (error.Message.Contains("duplicate JSON key", StringComparison.Ordinal))
+        {
+            return "duplicate-key";
+        }
+        var root = document.RootElement;
+        if (!root.TryGetProperty("format_version", out var version) || version.GetString() != "1.0.0")
+            return "version";
+        if (!root.TryGetProperty("cases", out var cases))
+            return "missing-field";
+        var allowed = new HashSet<string>(new[] { "format_version", "kind", "cases" }, StringComparer.Ordinal);
+        if (root.EnumerateObject().Any(property => !allowed.Contains(property.Name)))
+            return "unknown-field";
+        var kind = root.GetProperty("kind").GetString();
+        if (kind is not ("spec_match" or "int128" or "enforcement_gate"))
+            return "unknown-token";
+        if (kind == "int128")
+        {
+            var ids = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var item in cases.EnumerateArray())
+            {
+                if (!ids.Add(item.GetProperty("id").GetString()!))
+                    return "duplicate-id";
+                var words = new[] { "value", "high", "low" }
+                    .Select(field => item.GetProperty(field).GetString()!).ToArray();
+                if (words.Any(word => !System.Text.RegularExpressions.Regex.IsMatch(word, "^(0|-?[1-9][0-9]*)$")))
+                    return "integer-lexeme";
+                var value = BigInteger.Parse(words[0]);
+                if (value < -(BigInteger.One << 127) || value >= (BigInteger.One << 127))
+                    return "integer-range";
+            }
+        }
+        return "accepted";
+    }
+
+    [Fact]
     public void Int128VectorsAssertWordsAndIndependentDecode()
     {
         using var suite = Load("int128-v1.json");
