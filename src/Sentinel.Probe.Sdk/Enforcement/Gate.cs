@@ -154,9 +154,10 @@ public static class Gate
         ulong effective = ulong.MaxValue;
         foreach (var spec in enforcing)
         {
-            if (!spec.HasLatencyBudgetNanoseconds || spec.LatencyBudgetNanoseconds == 0)
+            ulong? specificationBudget = spec.LatencyBudgetNanoseconds;
+            if (!specificationBudget.HasValue || specificationBudget.Value == 0)
                 return ApplyFailMode(aggregateFailMode, "budget-exhausted", filterEpoch, null);
-            effective = Math.Min(effective, spec.LatencyBudgetNanoseconds);
+            effective = Math.Min(effective, specificationBudget.Value);
         }
         if (deps.NowMonotonicNs == null)
             return ApplyFailMode(aggregateFailMode, "clock-unavailable", filterEpoch, null);

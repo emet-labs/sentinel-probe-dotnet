@@ -436,7 +436,7 @@ public class GateTests
     public async Task MissingEligibleBudgetExhaustsWithoutClockOrDecide()
     {
         var spec = TestSupport.AskAndBlockSpec();
-        spec.ClearLatencyBudgetNanoseconds();
+        spec.LatencyBudgetNanoseconds = null;
         var mock = new MockDecider();
         int clockCalls = 0;
         var deps = new Deps
