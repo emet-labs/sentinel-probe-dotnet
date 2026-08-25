@@ -1,6 +1,8 @@
 using System.Numerics;
 using System.Text.Json;
 using Emet.Sentinel.Model.V1;
+using Emet.Sentinel.Probe.V1;
+using Sentinel.Probe.Sdk.Enforcement;
 using Sentinel.Probe.Sdk.Filter;
 using Sentinel.Probe.Sdk.Int128;
 using Xunit;
@@ -98,6 +100,74 @@ public class ConformanceVectorsTests
                 Kind = vector.GetProperty("producer_event").GetProperty("kind").GetString()!,
             };
             Assert.Equal(vector.GetProperty("expected").GetBoolean(), SpecMatch.Selects(filter, producerEvent));
+        }
+    }
+
+    [Fact]
+    public async Task EnforcementVectorsInvokeProductionGate()
+    {
+        using var suite = Load("enforcement-gate-v1.json");
+        foreach (var vector in suite.RootElement.GetProperty("cases").EnumerateArray())
+        {
+            var accepted = new Dictionary<string, FailMode>(StringComparer.Ordinal);
+            EventFilter? filter = null;
+            var fixtureFilter = vector.GetProperty("filter");
+            if (fixtureFilter.ValueKind != JsonValueKind.Null)
+            {
+                filter = new EventFilter { Epoch = ulong.Parse(fixtureFilter.GetProperty("epoch").GetString()!) };
+                foreach (var fixture in fixtureFilter.GetProperty("specifications").EnumerateArray())
+                {
+                    var id = fixture.GetProperty("id").GetString()!;
+                    accepted[id] = fixture.GetProperty("accepted_fail_mode").GetString() == "closed" ? FailMode.FailModeClosed : FailMode.FailModeOpen;
+                    var match = new EventMatch
+                    {
+                        DeliveryMode = fixture.GetProperty("delivery_mode").GetString() == "ask_and_block" ? DeliveryMode.DeliveryModeAskAndBlock : DeliveryMode.DeliveryModeShipAsync,
+                    };
+                    match.EventKinds.AddRange(fixture.GetProperty("event_kinds").EnumerateArray().Select(value => value.GetString()!));
+                    filter.Specifications.Add(new SpecificationFilter
+                    {
+                        SpecificationId = id,
+                        EventMatch = match,
+                        FailMode = fixture.GetProperty("fail_mode").GetString() == "closed" ? FailMode.FailModeClosed : FailMode.FailModeOpen,
+                        EvaluationMode = EvaluationMode.EvaluationModeEnforce,
+                        Readiness = Readiness.ReadinessActive,
+                        LatencyBudgetNanoseconds = ulong.Parse(fixture.GetProperty("latency_budget_ns").GetString()!),
+                    });
+                }
+            }
+            var reads = vector.GetProperty("clock_reads_ns").EnumerateArray().Select(value => long.Parse(value.GetString()!)).ToArray();
+            var readIndex = 0;
+            var requests = new List<DecideRequest>();
+            var decider = vector.GetProperty("decider").GetProperty("result").GetString()!;
+            var actions = new Dictionary<string, DecisionAction>
+            {
+                ["permit"] = DecisionAction.DecisionActionPermit,
+                ["deny"] = DecisionAction.DecisionActionDeny,
+                ["defer"] = DecisionAction.DecisionActionDefer,
+                ["unspecified"] = DecisionAction.DecisionActionUnspecified,
+            };
+            var outcome = await Gate.GateAsync(
+                new ProducerEvent { Id = "fixture-event", Kind = vector.GetProperty("event").GetProperty("kind").GetString()! },
+                filter,
+                vector.GetProperty("local_deadline_ns").ValueKind == JsonValueKind.Null ? null : long.Parse(vector.GetProperty("local_deadline_ns").GetString()!),
+                new Deps
+                {
+                    NowMonotonicNs = () => readIndex < reads.Length ? reads[readIndex++] : throw new InvalidOperationException("clock script exhausted"),
+                    AcceptedFailModeFor = spec => accepted[spec.SpecificationId],
+                    Decide = (request, _) =>
+                    {
+                        requests.Add(request);
+                        return Task.FromResult(decider == "transport_error"
+                            ? new DecideOutcome(null, new Exception("fixture-transport-error"))
+                            : new DecideOutcome(new DecideResponse { Action = actions[decider] }, null));
+                    },
+                },
+                new Options { SourceHandle = "fixture-source", RequestId = "fixture-request", IdempotencyKey = "fixture-idempotency" },
+                CancellationToken.None);
+            var expected = vector.GetProperty("expected");
+            Assert.Equal(expected.GetProperty("kind").GetString(), outcome.Kind.Name());
+            Assert.Equal(expected.GetProperty("decide_calls").GetInt32(), requests.Count);
+            Assert.Equal(reads.Length, readIndex);
         }
     }
 }
