@@ -139,7 +139,7 @@ public static class Gate
         var enforcing = new List<SpecificationFilter>();
         foreach (var spec in filter.Specifications)
         {
-            if (spec != null && SpecMatch.Selects(spec, @event) && IsAskAndBlock(spec))
+            if (spec != null && SpecMatch.Selects(spec, @event) && IsEnforceable(spec))
             {
                 enforcing.Add(spec);
             }
@@ -151,19 +151,23 @@ public static class Gate
 
         // 3. Aggregate fail mode: fail-closed wins.
         FailMode aggregateFailMode = ComputeAggregateFailMode(enforcing, deps);
+        ulong effective = ulong.MaxValue;
+        foreach (var spec in enforcing)
+        {
+            if (!spec.HasLatencyBudgetNanoseconds || spec.LatencyBudgetNanoseconds == 0)
+                return ApplyFailMode(aggregateFailMode, "budget-exhausted", filterEpoch, null);
+            effective = Math.Min(effective, spec.LatencyBudgetNanoseconds);
+        }
+        if (deps.NowMonotonicNs == null)
+            return ApplyFailMode(aggregateFailMode, "clock-unavailable", filterEpoch, null);
+        long anchor = deps.NowMonotonicNs();
+        if (deadlineNs.HasValue) effective = Math.Min(effective, Budget.RemainingTransportBudgetNs(deadlineNs.Value, anchor));
 
         // 4. Budget. Exhausted before the call means apply the fail mode without asking, so a Probe
         //    that is already out of time does not spend more of it.
-        ulong? remainingBudget = null;
-        if (deadlineNs.HasValue)
-        {
-            ulong remaining = Budget.RemainingTransportBudgetNs(deadlineNs.GetValueOrDefault(), deps.NowMonotonicNs());
-            if (remaining == 0)
-            {
-                return ApplyFailMode(aggregateFailMode, "budget-exhausted", filterEpoch, null);
-            }
-            remainingBudget = remaining;
-        }
+        ulong remaining = Budget.Remaining(anchor, effective, deps.NowMonotonicNs());
+        if (remaining == 0) return ApplyFailMode(aggregateFailMode, "budget-exhausted", filterEpoch, null);
+        ulong? remainingBudget = remaining;
 
         // 5. Build the request from the already-projected event.
         var request = new DecideRequest
@@ -205,14 +209,15 @@ public static class Gate
         }
 
         // 7. Honour the answer.
-        return HandleResponse(outcome.Response, aggregateFailMode, filterEpoch, deadlineNs, deps);
+        return HandleResponse(outcome.Response, aggregateFailMode, filterEpoch, anchor, effective, deps);
     }
 
     private static GateOutcome HandleResponse(
         DecideResponse response,
         FailMode aggregateFailMode,
         ulong filterEpoch,
-        long? deadlineNs,
+        long anchor,
+        ulong effectiveBudget,
         Deps deps)
     {
         var decisions = response.Specifications;
@@ -226,11 +231,7 @@ public static class Gate
                 return new GateOutcome { Kind = OutcomeKind.Deny, Reason = "deny", FilterEpoch = filterEpoch, Specifications = decisions };
 
             case DecisionAction.DecisionActionDefer:
-                if (deadlineNs == null)
-                {
-                    return new GateOutcome { Kind = OutcomeKind.Defer, Reason = "defer", FilterEpoch = filterEpoch, Specifications = decisions };
-                }
-                if (Budget.RemainingTransportBudgetNs(deadlineNs.GetValueOrDefault(), deps.NowMonotonicNs()) > 0)
+                if (Budget.Remaining(anchor, effectiveBudget, deps.NowMonotonicNs()) > 0)
                 {
                     return new GateOutcome { Kind = OutcomeKind.Defer, Reason = "defer", FilterEpoch = filterEpoch, Specifications = decisions };
                 }
@@ -277,8 +278,10 @@ public static class Gate
         return FailMode.FailModeOpen;
     }
 
-    private static bool IsAskAndBlock(SpecificationFilter spec) =>
-        spec?.EventMatch?.DeliveryMode == DeliveryMode.DeliveryModeAskAndBlock;
+    private static bool IsEnforceable(SpecificationFilter spec) =>
+        spec?.EventMatch?.DeliveryMode == DeliveryMode.DeliveryModeAskAndBlock &&
+        spec.EvaluationMode == EvaluationMode.EvaluationModeEnforce &&
+        spec.Readiness == Readiness.ReadinessActive;
 
     /// <summary>
     /// Renders a transport failure for the audit record, distinguishing a cancellation/timeout from

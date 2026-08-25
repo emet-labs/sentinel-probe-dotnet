@@ -33,6 +33,9 @@ internal static class TestSupport
             SpecificationVersion = "1.0.0",
             EventMatch = new EventMatch { EventKinds = kinds ?? new(), DeliveryMode = deliveryMode },
             FailMode = failMode,
+            EvaluationMode = EvaluationMode.EvaluationModeEnforce,
+            Readiness = Readiness.ReadinessActive,
+            LatencyBudgetNanoseconds = 10_000,
         };
 
     public static SpecificationFilter AskAndBlockSpec() =>

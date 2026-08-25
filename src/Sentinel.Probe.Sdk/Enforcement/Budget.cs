@@ -13,7 +13,13 @@ public static class Budget
 {
     public static ulong RemainingTransportBudgetNs(long deadlineNs, long nowNs)
     {
-        long remaining = deadlineNs - nowNs;
-        return remaining <= 0 ? 0 : (ulong)remaining;
+        ulong delta = unchecked((ulong)deadlineNs - (ulong)nowNs);
+        return delta < (1UL << 63) ? delta : 0UL;
+    }
+
+    internal static ulong Remaining(long anchor, ulong budget, long nowNs)
+    {
+        ulong elapsed = unchecked((ulong)nowNs - (ulong)anchor);
+        return elapsed >= (1UL << 63) || elapsed >= budget ? 0UL : budget - elapsed;
     }
 }
