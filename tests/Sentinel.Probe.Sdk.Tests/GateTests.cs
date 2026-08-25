@@ -431,4 +431,25 @@ public class GateTests
         Assert.False(OutcomeKind.Defer.Permitted());
         Assert.False(OutcomeKind.FailClosedDeny.Permitted());
     }
+
+    [Fact]
+    public async Task MissingEligibleBudgetExhaustsWithoutClockOrDecide()
+    {
+        var spec = TestSupport.AskAndBlockSpec();
+        spec.ClearLatencyBudgetNanoseconds();
+        var mock = new MockDecider();
+        int clockCalls = 0;
+        var deps = new Deps
+        {
+            Decide = mock.DecideAsync,
+            NowMonotonicNs = () => { clockCalls++; return 0; },
+            AcceptedFailModeFor = TestSupport.AlwaysOpen,
+        };
+        var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
+            TestSupport.MakeFilter(U64(TestSupport.TestEpoch), spec), null, deps,
+            TestSupport.TestOptions, CancellationToken.None);
+        Assert.Equal(OutcomeKind.FailOpenPermit, outcome.Kind);
+        Assert.Equal(0, clockCalls);
+        Assert.Equal(0, mock.CallCount);
+    }
 }
