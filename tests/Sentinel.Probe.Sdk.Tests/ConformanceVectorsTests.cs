@@ -41,6 +41,15 @@ public class ConformanceVectorsTests
     }
 
     [Fact]
+    public void ManifestSuiteRegistryFailsClosed()
+    {
+        using var manifest = Load("manifest-v1.json");
+        var kinds = manifest.RootElement.GetProperty("suites").EnumerateArray()
+            .Select(entry => entry.GetProperty("kind").GetString()).ToArray();
+        Assert.Equal(new[] { "spec_match", "int128", "enforcement_gate" }, kinds);
+    }
+
+    [Fact]
     public void Int128VectorsAssertWordsAndIndependentDecode()
     {
         using var suite = Load("int128-v1.json");
