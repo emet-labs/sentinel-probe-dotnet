@@ -432,6 +432,86 @@ public class GateTests
         Assert.False(OutcomeKind.FailClosedDeny.Permitted());
     }
 
+    // The behavior issue #113 is named for: with two-or-more eligible Specifications carrying
+    // different positive budgets, the effective (wire) budget must be the smallest one, not the
+    // largest and not merely "a" budget.
+    [Fact]
+    public async Task EffectiveBudgetIsMinimumAcrossEligibleSpecifications()
+    {
+        var specA = TestSupport.MakeSpec("spec-a", new() { TestSupport.TestKind }, FailMode.FailModeOpen, DeliveryMode.DeliveryModeAskAndBlock);
+        specA.LatencyBudgetNanoseconds = 50_000;
+        var specB = TestSupport.MakeSpec("spec-b", new() { TestSupport.TestKind }, FailMode.FailModeOpen, DeliveryMode.DeliveryModeAskAndBlock);
+        specB.LatencyBudgetNanoseconds = 8_000;
+        var specC = TestSupport.MakeSpec("spec-c", new() { TestSupport.TestKind }, FailMode.FailModeOpen, DeliveryMode.DeliveryModeAskAndBlock);
+        specC.LatencyBudgetNanoseconds = 20_000;
+
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionPermit) };
+        var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
+            TestSupport.MakeFilter(U64(TestSupport.TestEpoch), specA, specB, specC),
+            null, TestSupport.MakeDeps(mock, 0), TestSupport.TestOptions, CancellationToken.None);
+
+        Assert.Equal(OutcomeKind.Permit, outcome.Kind);
+        Assert.Equal(8_000UL, mock.LastRequest!.RemainingTransportBudgetNanoseconds);
+    }
+
+    [Fact]
+    public async Task DeferGatedByMinimumSpecificationBudgetNotTheLargest()
+    {
+        var specA = TestSupport.MakeSpec("spec-a", new() { TestSupport.TestKind }, FailMode.FailModeOpen, DeliveryMode.DeliveryModeAskAndBlock);
+        specA.LatencyBudgetNanoseconds = 20_000;
+        var specB = TestSupport.MakeSpec("spec-b", new() { TestSupport.TestKind }, FailMode.FailModeOpen, DeliveryMode.DeliveryModeAskAndBlock);
+        specB.LatencyBudgetNanoseconds = 5_000;
+
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionDefer) };
+        int calls = 0;
+        var deps = TestSupport.MakeDeps(mock, 0);
+        deps = new Deps
+        {
+            Decide = deps.Decide,
+            NowMonotonicNs = () =>
+            {
+                calls++;
+                return calls <= 2 ? 0 : 5_000; // past the smaller budget, not the larger one
+            },
+            AcceptedFailModeFor = deps.AcceptedFailModeFor,
+        };
+
+        var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
+            TestSupport.MakeFilter(U64(TestSupport.TestEpoch), specA, specB),
+            null, deps, TestSupport.TestOptions, CancellationToken.None);
+
+        Assert.Equal(OutcomeKind.FailOpenPermit, outcome.Kind);
+        Assert.Equal("defer-budget-exhausted", outcome.Reason);
+    }
+
+    // No caller deadline is required for a Specification's own latency budget to eventually
+    // time out a DEFER.
+    [Fact]
+    public async Task WithoutCallerDeadlineDeferTimesOutOnceSpecificationBudgetIsExhausted()
+    {
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionDefer) };
+        int calls = 0;
+        var baseDeps = TestSupport.MakeDeps(mock, 0);
+        var deps = new Deps
+        {
+            Decide = baseDeps.Decide,
+            NowMonotonicNs = () =>
+            {
+                calls++;
+                return calls <= 2 ? 0 : 10_000; // after the response: the spec budget is gone
+            },
+            AcceptedFailModeFor = baseDeps.AcceptedFailModeFor,
+        };
+
+        var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
+            TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
+            null, deps, TestSupport.TestOptions, CancellationToken.None);
+
+        Assert.Equal(OutcomeKind.FailOpenPermit, outcome.Kind);
+        Assert.Equal("defer-budget-exhausted", outcome.Reason);
+        Assert.Equal(1, mock.CallCount);
+    }
+
     [Fact]
     public async Task MissingEligibleBudgetExhaustsWithoutClockOrDecide()
     {
