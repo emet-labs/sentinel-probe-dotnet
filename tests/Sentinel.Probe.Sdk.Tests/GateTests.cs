@@ -234,18 +234,18 @@ public class GateTests
     }
 
     [Fact]
-    public async Task WithoutBudgetPermits()
+    public async Task WithoutCallerBudgetUsesSpecificationBudget()
     {
         var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionPermit) };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
             null, TestSupport.MakeDeps(mock, 0), TestSupport.TestOptions, CancellationToken.None);
         Assert.Equal(OutcomeKind.Permit, outcome.Kind);
-        Assert.Null(mock.LastRequest!.RemainingTransportBudgetNanoseconds);
+        Assert.Equal(10_000UL, mock.LastRequest!.RemainingTransportBudgetNanoseconds);
     }
 
     [Fact]
-    public async Task WithoutBudgetDefersIndefinitely()
+    public async Task WithoutCallerBudgetDefersWhileSpecificationBudgetRemains()
     {
         var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionDefer) };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
