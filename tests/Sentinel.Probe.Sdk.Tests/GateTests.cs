@@ -532,4 +532,41 @@ public class GateTests
         Assert.Equal(0, clockCalls);
         Assert.Equal(0, mock.CallCount);
     }
+
+    // Issue #123 asked whether an injected monotonic clock that FAILS (as opposed to one that is
+    // missing) should degrade to the aggregate fail mode with reason "clock-unavailable", or
+    // surface. The maintainer ruling on PR #127 is that it surfaces: a clock that is wired up but
+    // cannot be read is a caller bug, and there is no real-world scenario that makes it worth
+    // absorbing. The .NET port has always propagated, so this pins existing behaviour rather than
+    // changing it -- five of six SDKs had no coverage here at all, which is how the ports drifted
+    // apart. TypeScript's outlier catch is removed in the same change.
+    //
+    // The read exercised is the third and last one, after the DEFER response, so the throw has to
+    // escape the catch around the awaited Decide rather than be relabelled a transport error.
+    [Fact]
+    public async Task ThrowingClockPropagates()
+    {
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionDefer) };
+        int clockCalls = 0;
+        var deps = new Deps
+        {
+            Decide = mock.DecideAsync,
+            NowMonotonicNs = () =>
+            {
+                clockCalls++;
+                if (clockCalls == 3) throw new InvalidOperationException("clock hardware fault");
+                return 0;
+            },
+            AcceptedFailModeFor = TestSupport.AlwaysOpen,
+        };
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(() => Gate.GateAsync(
+            TestSupport.MakeEvent(TestSupport.TestKind),
+            TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
+            I64(10000), deps, TestSupport.TestOptions, CancellationToken.None));
+
+        Assert.Equal("clock hardware fault", thrown.Message);
+        Assert.Equal(3, clockCalls);
+        Assert.Equal(1, mock.CallCount);
+    }
 }
