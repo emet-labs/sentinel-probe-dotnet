@@ -35,7 +35,8 @@ internal static class ActivityBuilder
         IEnumerable<KeyValuePair<string, object?>>? tags = null,
         string? parentSpanHex = null,
         IEnumerable<(string SpanHex, IEnumerable<KeyValuePair<string, object?>>? Tags)>? links = null,
-        DateTime? startTime = null)
+        DateTime? startTime = null,
+        DateTime? endTime = null)
     {
         ActivityContext? parentContext = null;
         if (parentSpanHex != null)
@@ -62,6 +63,10 @@ internal static class ActivityBuilder
         if (tags != null)
         {
             foreach (var t in tags) activity.SetTag(t.Key, t.Value);
+        }
+        if (endTime.HasValue)
+        {
+            activity.SetEndTime(DateTime.SpecifyKind(endTime.Value, DateTimeKind.Utc));
         }
         activity.Stop();
         return activity;

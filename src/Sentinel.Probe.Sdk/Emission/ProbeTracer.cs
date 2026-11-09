@@ -10,10 +10,10 @@ namespace Sentinel.Probe.Sdk.Emission;
 // ProbeTracer — the .NET analog of sdk/go/emission/tracer.go (mirrors otel-bridge.ts).
 //
 // .NET OTel is built on System.Diagnostics.Activity: the "tracer" is an ActivitySource and the
-// provider enables sources and attaches span processors. No exporter is configured, deliberately:
-// ADR-0002 makes OTel an adapter rather than the substrate, so the host owns export — it attaches
-// an OTLP exporter to Provider. The SDK never chooses where spans go. The caller owns the
-// returned tracer's lifecycle and must Dispose it.
+// provider enables sources and attaches span processors. The Probe wire is OTLP/HTTP
+// (the ADR-0002 exception in #398): OtlpExporter posts ended spans to Sentinel and does not
+// leave that choice to the host. Connect is not the wire. The caller owns the returned
+// tracer's lifecycle and must Dispose it. Resource merge behaviour is unchanged.
 
 /// <summary>Configures the Probe's tracer. Analog of EmissionOptions.</summary>
 public sealed class ProbeTracerOptions

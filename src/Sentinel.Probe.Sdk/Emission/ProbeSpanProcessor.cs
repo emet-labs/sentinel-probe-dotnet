@@ -10,8 +10,8 @@ namespace Sentinel.Probe.Sdk.Emission;
 // BaseProcessor<Activity>, so the Probe wires span-to-event conversion into the SDK's processor
 // pipeline exactly as a host would attach any other processor to a TracerProvider.
 //
-// The processor never decides where events go: it hands each converted ProducerEvent to an
-// injected callback (the host's emitter/enqueuer), keeping the SDK export-agnostic per ADR-0002.
+// The processor converts and forwards. Where the bytes go is OtlpExporter, the OTLP/HTTP
+// Probe wire, not a host-chosen exporter and not Connect.
 
 /// <summary>
 /// A span processor that converts each ended Activity into a ProducerEvent via a supplied

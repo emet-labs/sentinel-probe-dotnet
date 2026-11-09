@@ -262,45 +262,35 @@ public class SpanToEventTests
     }
 
     [Fact]
-    public void MissingLinkEventIDFallsBackToSpanIDAndReports()
+    public void MissingLinkEventIdFailsAndDoesNotUseTheSpanId()
     {
-        var malformed = new List<(string, string)>();
-        var e = SpanToEventConverter.SpanToEvent(new SpanConversion
+        var error = Assert.Throws<Sentinel.Probe.Sdk.Otlp.OtlpExportException>(() => SpanToEventConverter.SpanToEvent(new SpanConversion
         {
             Activity = ActivityBuilder.Build(links: new (string, IEnumerable<KeyValuePair<string, object?>>?)[] { ("2122232425262728", null) }),
-            OnMalformedLink = (source, spanId) => malformed.Add((source, spanId)),
-        });
-        Assert.Equal(new[] { "2122232425262728" }, e.CausalPredecessorIds);
-        Assert.Equal(new[] { (ReservedAttributes.MalformedLinkSourceLink, "2122232425262728") }, malformed);
+        }));
+        Assert.DoesNotContain("2122232425262728", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void MissingParentEventIDFallsBackToSpanIDAndReports()
+    public void MissingParentEventIdFailsAndDoesNotUseTheSpanId()
     {
-        var malformed = new List<(string, string)>();
-        var e = SpanToEventConverter.SpanToEvent(new SpanConversion
+        var error = Assert.Throws<Sentinel.Probe.Sdk.Otlp.OtlpExportException>(() => SpanToEventConverter.SpanToEvent(new SpanConversion
         {
             Activity = ActivityBuilder.Build(parentSpanHex: "1112131415161718"),
-            OnMalformedLink = (source, spanId) => malformed.Add((source, spanId)),
-        });
-        Assert.Equal(new[] { "1112131415161718" }, e.CausalPredecessorIds);
-        Assert.Equal(new[] { (ReservedAttributes.MalformedLinkSourceParent, "1112131415161718") }, malformed);
+        }));
+        Assert.DoesNotContain("1112131415161718", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void MistypedReservedAttributeTakesTheFallbackPath()
+    public void MistypedParentEventIdFailsAndDoesNotUseTheSpanId()
     {
-        var malformed = new List<string>();
-        var e = SpanToEventConverter.SpanToEvent(new SpanConversion
+        var error = Assert.Throws<Sentinel.Probe.Sdk.Otlp.OtlpExportException>(() => SpanToEventConverter.SpanToEvent(new SpanConversion
         {
             Activity = ActivityBuilder.Build(
                 parentSpanHex: "1112131415161718",
                 tags: new[] { KVP(ReservedAttributes.AttributeParentEventID, 7L) }),
-            OnMalformedLink = (source, _) => malformed.Add(source),
-        });
-        Assert.Equal(new[] { "1112131415161718" }, e.CausalPredecessorIds);
-        Assert.Equal(new[] { ReservedAttributes.MalformedLinkSourceParent }, malformed);
-        Assert.Empty(e.Attributes); // reserved key excluded even when mistyped
+        }));
+        Assert.DoesNotContain("1112131415161718", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -324,13 +314,13 @@ public class SpanToEventTests
     }
 
     [Fact]
-    public void NilOnMalformedLinkIsSafe()
+    public void MissingLinkWithoutACallbackStillFailsTheExport()
     {
-        var e = SpanToEventConverter.SpanToEvent(new SpanConversion
+        var error = Assert.Throws<Sentinel.Probe.Sdk.Otlp.OtlpExportException>(() => SpanToEventConverter.SpanToEvent(new SpanConversion
         {
             Activity = ActivityBuilder.Build(links: new (string, IEnumerable<KeyValuePair<string, object?>>?)[] { ("2122232425262728", null) }),
-        });
-        Assert.Single(e.CausalPredecessorIds);
+        }));
+        Assert.DoesNotContain("2122232425262728", error.Message, StringComparison.Ordinal);
     }
 
     private static KeyValuePair<string, object?> KVP(string key, object? value) => new(key, value);

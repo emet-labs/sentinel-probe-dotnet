@@ -8,14 +8,9 @@ using Sentinel.Probe.Sdk.Connect;
 
 namespace Sentinel.Probe.Sdk.Client;
 
-// Hand-written Connect unary transport over HttpClient — the .NET analog of
-// sdk/go/client/transport.go (which uses connectrpc.com/connect over net/http).
-//
-// There is no connectrpc/csharp, so the unary Decide RPC is written directly on System.Net.Http:
-// Content-Type "application/proto", a raw protobuf request body, and a raw protobuf response body
-// on success. On a non-2xx status the body is Connect's JSON error envelope, which is parsed into a
-// ConnectException carrying the wire code for the gate's audit record — exactly what the Go
-// reference's *connect.Error gives describeError.
+// Hand-written Connect unary transport over HttpClient. It stays compiled so the proto
+// codec tests still have a client, but it is not the Probe wire. #398 carries decisions
+// back as OTLP logs; Gate.FromLogReceiver waits for those logs and does not call Decide.
 
 /// <summary>The outcome of a Decide RPC: exactly one of Response / Error is non-null.</summary>
 public readonly record struct DecideResult(DecideResponse? Response, Exception? Error);

@@ -35,9 +35,9 @@ public sealed class ProbeClient
     private readonly ISentinelDecisionServiceClient _decider;
 
     /// <summary>
-    /// Builds a ProbeClient. The decider is a REQUIRED parameter with no default: a silently-defaulted
-    /// transport would hide a misconfigured endpoint until the first enforcement call. Pass
-    /// <see cref="SentinelTransport"/> in production and a stub in tests.
+    /// Builds a ProbeClient. The decider argument remains for the compiled Connect client and for
+    /// tests. The live enforcement path does not use it: pass <see cref="Enforcement.Gate.FromLogReceiver"/>
+    /// to the gate so a DecideResponse arrives as an OTLP log.
     /// </summary>
     public ProbeClient(Config config, ISentinelDecisionServiceClient decider)
     {

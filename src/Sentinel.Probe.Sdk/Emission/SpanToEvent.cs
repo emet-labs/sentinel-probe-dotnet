@@ -5,6 +5,7 @@ using System.Linq;
 using Emet.Sentinel.Model.V1;
 using Google.Protobuf;
 using Sentinel.Probe.Sdk.Int128;
+using Sentinel.Probe.Sdk.Otlp;
 
 // Span-to-event conversion — the .NET analog of sdk/go/emission/spantoevent.go
 // (mirrors span-to-event.ts).
@@ -62,8 +63,8 @@ public sealed class SpanConversion
     public string? EventId { get; init; }
 
     /// <summary>
-    /// When non-null, called once per causal predecessor that had to fall back to a hex span ID
-    /// because the producer contract was violated. source is "parent" or "link".
+    /// Retained so existing callers still compile. A missing predecessor event id fails the
+    /// export. The span id is not passed here and is not stored as causality.
     /// </summary>
     public Action<string, string>? OnMalformedLink { get; init; }
 }
@@ -90,7 +91,7 @@ public static class SpanToEventConverter
             Attributes = MapAttributes(activity.TagObjects),
             ClaimedCapabilities = conversion.ClaimedCapabilities,
             ClaimedSensitivity = conversion.ClaimedSensitivity,
-            CausalPredecessorIds = CollectCausalPredecessors(activity, conversion.OnMalformedLink),
+            CausalPredecessorIds = CollectCausalPredecessors(activity),
         };
     }
 
@@ -195,8 +196,11 @@ public static class SpanToEventConverter
         };
     }
 
-    /// <summary>Reads the parent edge and every link edge, in that order.</summary>
-    private static List<string> CollectCausalPredecessors(Activity activity, Action<string, string>? onMalformedLink)
+    /// <summary>
+    /// Reads the parent edge and every link edge, in that order. A parent span or a link
+    /// without <c>sentinel.event.id</c> fails the export. The span id is not a predecessor.
+    /// </summary>
+    private static List<string> CollectCausalPredecessors(Activity activity)
     {
         var predecessors = new List<string>();
 
@@ -207,9 +211,7 @@ public static class SpanToEventConverter
         }
         else if (activity.ParentSpanId != default)
         {
-            string spanId = activity.ParentSpanId.ToHexString();
-            predecessors.Add(spanId);
-            onMalformedLink?.Invoke(ReservedAttributes.MalformedLinkSourceParent, spanId);
+            throw new OtlpExportException("parent span is missing sentinel.parent.event.id");
         }
 
         // Links: each link carries its target's event ID in that link's OWN tags.
@@ -220,9 +222,7 @@ public static class SpanToEventConverter
                 predecessors.Add(linkEventId);
                 continue;
             }
-            string spanId = link.Context.SpanId.ToHexString();
-            predecessors.Add(spanId);
-            onMalformedLink?.Invoke(ReservedAttributes.MalformedLinkSourceLink, spanId);
+            throw new OtlpExportException("link is missing sentinel.event.id");
         }
 
         return predecessors;

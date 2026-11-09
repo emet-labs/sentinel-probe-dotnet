@@ -10,16 +10,19 @@ The SDK:
   normalizes (`Emission/`)
 - applies attribute-level Filter projection before shipping — relevance, never
   sampling (`Filter/`, ADR-0006)
-- enforces `ASK_AND_BLOCK` specs via the decision endpoint (`Enforcement/`, the
-  ADR-0023 bounded fragment)
+- exports ended spans and producer completeness as OTLP/HTTP protobuf, and
+  receives Verdict, EventFilter, and DecideResponse on `127.0.0.1` (`Otlp/`,
+  the #398 Probe-wire exception). The gate waits on that log. Connect is not
+  the live path.
 - reads source-tier from deployment config (`Config/`, ADR-0022, never hard-coded)
 
-## Deferred acceptance criterion: SagaShop integration
+## OTLP wire
 
-The live SagaShop integration test (acceptance criterion 5) is deferred. No
-`SentinelDecisionService` is served anywhere in this repository — the same blocker
-documented in `sdk/go/README.md`. The SDK and its xUnit test suite against the proto
-contract are buildable and fully green now.
+`OtlpExporter` posts `ExportTraceServiceRequest` bytes to `/v1/traces` and a
+`ProducerCompletenessSignal` log to `/v1/logs`, with `x-sentinel-source-handle`.
+A missing predecessor id fails that export. `OtlpLogReceiver` binds `127.0.0.1`
+and serves `POST /v1/logs`. `harness-probe-sdk-dotnet` builds `sentinel-periphery`
+and runs the sample CAT-1 charge/ship round trip against it.
 
 ## Generated proto types
 
@@ -51,9 +54,8 @@ covers 171 cases mirroring the Go `*_test.go` files.
 - **`System.Numerics.BigInteger`** for Int128: the proto `Int128` (two `int64` words)
   is decoded into `BigInteger` via the `Int128Codec` helper, avoiding any external
   dependency.
-- **Hand-written Connect unary over `HttpClient`**: the decision endpoint uses a
-  straight `POST` with `Content-Type: application/proto` rather than a gRPC
-  channel, mirroring the Go SDK's `Connect` unary-over-HTTP approach.
+- **OTLP/HTTP protobuf**: traces and completeness are posted by `OtlpExporter`.
+  The compiled Connect client remains for codec tests and is not the gate's path.
 - **`ProbeSpanProcessor : BaseProcessor<Activity>`**: the OTel span processor hooks
   `OnEnd` to convert and emit events, with `Activity.TagObjects` for tag access.
 - **Pinned NuGet versions**: all package references pin exact versions

@@ -1,0 +1,496 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.IO.Compression;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Emet.Sentinel.Model.V1;
+using Emet.Sentinel.Probe.V1;
+using Google.Protobuf;
+
+namespace Sentinel.Probe.Sdk.Otlp;
+
+/// <summary>Verdict outcome read from an OTLP log body. Unspecified is not a pass.</summary>
+public enum ReceivedVerdictOutcome
+{
+    Unspecified = 0,
+    Satisfy = 1,
+    Violate = 2,
+    Inconclusive = 3,
+}
+
+/// <summary>A Verdict the log receiver decoded. The id and outcome are the wire fields.</summary>
+public sealed class ReceivedVerdict
+{
+    public required string Id { get; init; }
+    public required ReceivedVerdictOutcome Outcome { get; init; }
+}
+
+/// <summary>
+/// Serves <c>POST /v1/logs</c> on <c>127.0.0.1</c>. Accepts identity and gzip
+/// <c>application/x-protobuf</c> and decodes Verdict, EventFilter, and DecideResponse.
+/// An unspecified decision action is an error and is not delivered to the gate.
+/// </summary>
+public sealed class OtlpLogReceiver : IDisposable
+{
+    private const int GzipLimit = 8 * 1024 * 1024;
+
+    private readonly TcpListener _listener;
+    private readonly Thread _thread;
+    private readonly int _port;
+    private readonly object _gate = new();
+    private readonly List<ReceivedVerdict> _verdicts = new();
+    private readonly List<EventFilter> _filters = new();
+    private readonly Dictionary<string, DecideResponse> _decisions = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, TaskCompletionSource<DecideResponse>> _waiters = new(StringComparer.Ordinal);
+    private volatile bool _stop;
+
+    public string LogsUrl => "http://127.0.0.1:" + _port.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/v1/logs";
+
+    public int Port => _port;
+
+    private OtlpLogReceiver(TcpListener listener, int port)
+    {
+        _listener = listener;
+        _port = port;
+        _thread = new Thread(Serve) { IsBackground = true, Name = "sentinel-otlp-logs" };
+        _thread.Start();
+    }
+
+    public static OtlpLogReceiver Start()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        return new OtlpLogReceiver(listener, port);
+    }
+
+    public IReadOnlyList<ReceivedVerdict> Verdicts
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return new List<ReceivedVerdict>(_verdicts);
+            }
+        }
+    }
+
+    public IReadOnlyList<EventFilter> Filters
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return new List<EventFilter>(_filters);
+            }
+        }
+    }
+
+    public Task<DecideResponse> WaitForDecisionAsync(string requestId, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(requestId))
+        {
+            throw new OtlpExportException("DecideResponse request_id is empty");
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+        var source = new TaskCompletionSource<DecideResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_gate)
+        {
+            if (_decisions.Remove(requestId, out var ready))
+            {
+                source.SetResult(ready);
+                return source.Task;
+            }
+            if (_waiters.ContainsKey(requestId))
+            {
+                throw new OtlpExportException("a decision wait is already registered for " + requestId);
+            }
+            _waiters.Add(requestId, source);
+        }
+        if (cancellationToken.CanBeCanceled)
+        {
+            cancellationToken.Register(() =>
+            {
+                lock (_gate)
+                {
+                    if (_waiters.TryGetValue(requestId, out var current) && ReferenceEquals(current, source))
+                    {
+                        _waiters.Remove(requestId);
+                    }
+                }
+                source.TrySetCanceled(cancellationToken);
+            });
+        }
+        return source.Task;
+    }
+
+    /// <summary>Decodes one uncompressed export. Returns the HTTP status the socket would send.</summary>
+    public int Ingest(byte[] body)
+    {
+        try
+        {
+            Apply(OtlpLogs.Decode(body));
+            return 200;
+        }
+        catch (OtlpExportException)
+        {
+            return 400;
+        }
+        catch (InvalidProtocolBufferException)
+        {
+            return 400;
+        }
+        catch (InvalidDataException)
+        {
+            return 400;
+        }
+    }
+
+    public void Dispose()
+    {
+        _stop = true;
+        try
+        {
+            _listener.Stop();
+        }
+        catch (SocketException)
+        {
+            // The accept loop is already gone.
+        }
+        lock (_gate)
+        {
+            foreach (var waiter in _waiters.Values)
+            {
+                waiter.TrySetException(new OtlpExportException("log receiver stopped"));
+            }
+            _waiters.Clear();
+        }
+    }
+
+    private void Apply(IReadOnlyList<DecodedLog> records)
+    {
+        var verdicts = new List<ReceivedVerdict>();
+        var filters = new List<EventFilter>();
+        var decisions = new List<DecideResponse>();
+        foreach (var record in records)
+        {
+            if (record.DroppedAttributesCount != 0)
+            {
+                throw new OtlpExportException("log record dropped attributes");
+            }
+            var payload = Attribute(record, OtlpLogs.PayloadTypeKey) ?? throw new OtlpExportException("log record is missing sentinel.payload.type");
+            RejectForeignAttributes(record, payload);
+            if (!record.BodyIsBytes || record.BodyBytes == null)
+            {
+                throw new OtlpExportException("log body is not protobuf bytes");
+            }
+            switch (payload)
+            {
+                case OtlpLogs.VerdictType:
+                    verdicts.Add(ReadVerdict(record.BodyBytes));
+                    break;
+                case OtlpLogs.EventFilterType:
+                    filters.Add(EventFilter.ParseFrom(record.BodyBytes));
+                    break;
+                case OtlpLogs.DecideResponseType:
+                    decisions.Add(ReadDecision(record));
+                    break;
+                default:
+                    throw new OtlpExportException("unsupported sentinel.payload.type " + payload);
+            }
+        }
+        lock (_gate)
+        {
+            foreach (var decision in decisions)
+            {
+                if (!_waiters.ContainsKey(decision.RequestId) && _decisions.ContainsKey(decision.RequestId))
+                {
+                    throw new OtlpExportException("duplicate DecideResponse " + decision.RequestId);
+                }
+            }
+            _verdicts.AddRange(verdicts);
+            _filters.AddRange(filters);
+            foreach (var decision in decisions)
+            {
+                if (_waiters.Remove(decision.RequestId, out var waiter))
+                {
+                    waiter.TrySetResult(decision);
+                }
+                else
+                {
+                    _decisions.Add(decision.RequestId, decision);
+                }
+            }
+        }
+    }
+
+    private static void RejectForeignAttributes(DecodedLog record, string payload)
+    {
+        foreach (var attribute in record.Attributes)
+        {
+            if (!attribute.Key.StartsWith("sentinel.", StringComparison.Ordinal))
+            {
+                if (attribute.Value.Case == OtlpValue.Shape.Double && !double.IsFinite(attribute.Value.Double))
+                {
+                    throw new OtlpExportException("non-finite double");
+                }
+                continue;
+            }
+            if (attribute.Key == OtlpLogs.PayloadTypeKey)
+            {
+                continue;
+            }
+            if (payload == OtlpLogs.DecideResponseType && attribute.Key == OtlpLogs.RequestIdKey)
+            {
+                continue;
+            }
+            throw new OtlpExportException("unexpected sentinel attribute " + attribute.Key);
+        }
+    }
+
+    private static DecideResponse ReadDecision(DecodedLog record)
+    {
+        var response = DecideResponse.ParseFrom(record.BodyBytes ?? Array.Empty<byte>());
+        var echoed = Attribute(record, OtlpLogs.RequestIdKey);
+        if (string.IsNullOrWhiteSpace(response.RequestId) || echoed != response.RequestId)
+        {
+            throw new OtlpExportException("sentinel.request_id does not match DecideResponse.request_id");
+        }
+        RequireAction(response.Action, "DecideResponse action");
+        foreach (var specification in response.Specifications)
+        {
+            RequireAction(specification.Action, "specification decision action");
+        }
+        return response;
+    }
+
+    private static void RequireAction(DecisionAction action, string what)
+    {
+        if (action is not (DecisionAction.DecisionActionPermit or DecisionAction.DecisionActionDeny or DecisionAction.DecisionActionDefer))
+        {
+            throw new OtlpExportException(what + " is unspecified");
+        }
+    }
+
+    private static ReceivedVerdict ReadVerdict(byte[] body)
+    {
+        string id = "";
+        var outcome = ReceivedVerdictOutcome.Unspecified;
+        using var input = new CodedInputStream(body);
+        uint tag;
+        while ((tag = input.ReadTag()) != 0)
+        {
+            switch (WireFormat.GetTagFieldNumber(tag))
+            {
+                case 1:
+                    id = input.ReadString();
+                    break;
+                case 2:
+                    outcome = (ReceivedVerdictOutcome)input.ReadInt32();
+                    break;
+                default:
+                    input.SkipLastField();
+                    break;
+            }
+        }
+        if (id.Length == 0)
+        {
+            throw new OtlpExportException("Verdict id is empty");
+        }
+        if (outcome is not (ReceivedVerdictOutcome.Satisfy or ReceivedVerdictOutcome.Violate or ReceivedVerdictOutcome.Inconclusive))
+        {
+            throw new OtlpExportException("Verdict outcome is unspecified");
+        }
+        return new ReceivedVerdict { Id = id, Outcome = outcome };
+    }
+
+    private static string? Attribute(DecodedLog record, string key)
+    {
+        foreach (var attribute in record.Attributes)
+        {
+            if (attribute.Key == key)
+            {
+                return OtlpTraces.StringOf(attribute.Value);
+            }
+        }
+        return null;
+    }
+
+    private void Serve()
+    {
+        while (!_stop)
+        {
+            TcpClient client;
+            try
+            {
+                client = _listener.AcceptTcpClient();
+            }
+            catch (SocketException)
+            {
+                break;
+            }
+            catch (InvalidOperationException)
+            {
+                break;
+            }
+            try
+            {
+                Handle(client);
+            }
+            catch (IOException)
+            {
+                // The peer closed the socket.
+            }
+            finally
+            {
+                client.Dispose();
+            }
+        }
+    }
+
+    private void Handle(TcpClient client)
+    {
+        using var stream = client.GetStream();
+        client.ReceiveTimeout = 5000;
+        var headerBytes = ReadHeaders(stream);
+        var headers = Encoding.ASCII.GetString(headerBytes);
+        var status = Route(headers, stream);
+        var reason = status switch
+        {
+            200 => "OK",
+            404 => "Not Found",
+            411 => "Length Required",
+            415 => "Unsupported Media Type",
+            _ => "Bad Request",
+        };
+        var response = "HTTP/1.1 " + status.ToString(System.Globalization.CultureInfo.InvariantCulture) + " " + reason
+            + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        var bytes = Encoding.ASCII.GetBytes(response);
+        stream.Write(bytes, 0, bytes.Length);
+    }
+
+    private int Route(string headers, NetworkStream stream)
+    {
+        var first = headers.Split("\r\n", 2)[0];
+        var parts = first.Split(' ');
+        if (parts.Length < 2 || !string.Equals(parts[0], "POST", StringComparison.Ordinal) || parts[1] != "/v1/logs")
+        {
+            return 404;
+        }
+        if (!MediaTypeIsProtobuf(headers))
+        {
+            return 415;
+        }
+        var encoding = Header(headers, "content-encoding");
+        if (encoding != null && !encoding.Equals("identity", StringComparison.OrdinalIgnoreCase) && !encoding.Equals("gzip", StringComparison.OrdinalIgnoreCase))
+        {
+            return 415;
+        }
+        if (!int.TryParse(Header(headers, "content-length"), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var length) || length < 0)
+        {
+            return 411;
+        }
+        var body = new byte[length];
+        var read = 0;
+        while (read < length)
+        {
+            var n = stream.Read(body, read, length - read);
+            if (n <= 0)
+            {
+                return 400;
+            }
+            read += n;
+        }
+        if (encoding != null && encoding.Equals("gzip", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                body = Inflate(body);
+            }
+            catch (InvalidDataException)
+            {
+                return 400;
+            }
+            catch (OtlpExportException)
+            {
+                return 400;
+            }
+        }
+        return Ingest(body);
+    }
+
+    private static byte[] Inflate(byte[] body)
+    {
+        using var input = new MemoryStream(body);
+        using var gzip = new GZipStream(input, CompressionMode.Decompress);
+        using var output = new MemoryStream();
+        var buffer = new byte[8192];
+        while (true)
+        {
+            var n = gzip.Read(buffer, 0, buffer.Length);
+            if (n == 0)
+            {
+                break;
+            }
+            if (output.Length + n > GzipLimit)
+            {
+                throw new OtlpExportException("gzip inflate exceeded the uncompressed limit");
+            }
+            output.Write(buffer, 0, n);
+        }
+        return output.ToArray();
+    }
+
+    private static bool MediaTypeIsProtobuf(string headers)
+    {
+        var value = Header(headers, "content-type");
+        if (value == null)
+        {
+            return false;
+        }
+        var essence = value.Split(';', 2)[0].Trim();
+        return essence.Equals(OtlpExporter.ProtobufMediaType, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? Header(string headers, string name)
+    {
+        foreach (var line in headers.Split("\r\n"))
+        {
+            var split = line.Split(':', 2);
+            if (split.Length == 2 && split[0].Trim().Equals(name, StringComparison.OrdinalIgnoreCase))
+            {
+                return split[1].Trim();
+            }
+        }
+        return null;
+    }
+
+    private static byte[] ReadHeaders(NetworkStream stream)
+    {
+        using var buffer = new MemoryStream();
+        while (buffer.Length < 64 * 1024)
+        {
+            var next = stream.ReadByte();
+            if (next < 0)
+            {
+                break;
+            }
+            buffer.WriteByte((byte)next);
+            if (buffer.Length < 4)
+            {
+                continue;
+            }
+            var raw = buffer.GetBuffer();
+            var count = (int)buffer.Length;
+            if (raw[count - 4] == (byte)'\r' && raw[count - 3] == (byte)'\n' && raw[count - 2] == (byte)'\r' && raw[count - 1] == (byte)'\n')
+            {
+                break;
+            }
+        }
+        return buffer.ToArray();
+    }
+}

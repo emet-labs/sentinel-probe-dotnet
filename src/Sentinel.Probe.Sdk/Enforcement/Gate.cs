@@ -6,6 +6,7 @@ using Emet.Sentinel.Model.V1;
 using Emet.Sentinel.Probe.V1;
 using Sentinel.Probe.Sdk.Connect;
 using Sentinel.Probe.Sdk.Filter;
+using Sentinel.Probe.Sdk.Otlp;
 
 namespace Sentinel.Probe.Sdk.Enforcement;
 
@@ -100,6 +101,39 @@ public sealed class Options
 
 public static class Gate
 {
+    /// <summary>
+    /// Adapts the OTLP log receiver to this gate. The returned delegate waits for a
+    /// <c>DecideResponse</c> log with the request id. It does not call Connect.
+    /// Cancellation and a receiver error still fall through to the fail mode below.
+    /// </summary>
+    public static DecideFunc FromLogReceiver(OtlpLogReceiver receiver)
+    {
+        if (receiver == null)
+        {
+            throw new ArgumentNullException(nameof(receiver));
+        }
+        return async (request, cancellationToken) =>
+        {
+            if (string.IsNullOrWhiteSpace(request.RequestId))
+            {
+                return new DecideOutcome(null, new InvalidOperationException("DecideRequest request_id is empty"));
+            }
+            try
+            {
+                var response = await receiver.WaitForDecisionAsync(request.RequestId, cancellationToken).ConfigureAwait(false);
+                return new DecideOutcome(response, null);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                return new DecideOutcome(null, ex);
+            }
+        };
+    }
+
     /// <summary>
     /// Enforces one ASK_AND_BLOCK event and returns the action the Probe must take. Control flow
     /// mirrors the reference step for step:
