@@ -5,6 +5,7 @@ using Emet.Sentinel.Probe.V1;
 using Sentinel.Probe.Sdk.Enforcement;
 using Sentinel.Probe.Sdk.Filter;
 using Sentinel.Probe.Sdk.Int128;
+using Sentinel.Probe.Sdk.Otlp;
 using Xunit;
 using Int128Value = Emet.Sentinel.Model.V1.Int128;
 
@@ -14,11 +15,11 @@ public class ConformanceVectorsTests
 {
     private static readonly string Root = Path.Combine(AppContext.BaseDirectory, "probe-sdk-conformance");
 
-    private static JsonDocument Load(string name)
+    private static JsonDocument Load(string name, string version = "1.0.0")
     {
         var document = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(Root, name)));
         RejectDuplicateKeys(document.RootElement);
-        Assert.Equal("1.0.0", document.RootElement.GetProperty("format_version").GetString());
+        Assert.Equal(version, document.RootElement.GetProperty("format_version").GetString());
         return document;
     }
 
@@ -45,16 +46,16 @@ public class ConformanceVectorsTests
     [Fact]
     public void ManifestSuiteRegistryFailsClosed()
     {
-        using var manifest = Load("manifest-v1.json");
+        using var manifest = Load("manifest-v1.json", "1.1.0");
         var kinds = manifest.RootElement.GetProperty("suites").EnumerateArray()
             .Select(entry => entry.GetProperty("kind").GetString()).ToArray();
-        Assert.Equal(new[] { "spec_match", "int128", "enforcement_gate" }, kinds);
+        Assert.Equal(new[] { "spec_match", "int128", "enforcement_gate", "otlp_signal" }, kinds);
     }
 
     [Fact]
     public void SharedMalformedCorpusIsRejectedByCategory()
     {
-        using var manifest = Load("manifest-v1.json");
+        using var manifest = Load("manifest-v1.json", "1.1.0");
         foreach (var fixture in manifest.RootElement.GetProperty("malformed").EnumerateArray())
         {
             var path = fixture.GetProperty("path").GetString()!;
@@ -222,4 +223,182 @@ public class ConformanceVectorsTests
             Assert.Equal(reads.Length, readIndex);
         }
     }
+
+    [Fact]
+    public void OtlpSignalVectorsDecodeEventsAndMessages()
+    {
+        using var suite = Load("otlp-signal-v1.json", "1.1.0");
+        Assert.Equal("otlp_signal", suite.RootElement.GetProperty("kind").GetString());
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var vector in suite.RootElement.GetProperty("cases").EnumerateArray())
+        {
+            Assert.True(ids.Add(vector.GetProperty("id").GetString()!));
+            var bytes = OtlpBytes(vector.GetProperty("path").GetString()!);
+            switch (vector.GetProperty("signal").GetString())
+            {
+                case "trace":
+                    AssertTrace(vector, bytes);
+                    break;
+                case "completeness":
+                    AssertCompleteness(vector, bytes);
+                    break;
+                case "verdict":
+                    AssertVerdict(vector, bytes);
+                    break;
+                case "event_filter":
+                    AssertFilter(vector, bytes);
+                    break;
+                case "decide_response":
+                    AssertDecision(vector, bytes);
+                    break;
+                default:
+                    throw new InvalidOperationException(vector.GetProperty("signal").GetString());
+            }
+        }
+    }
+
+    private static void AssertTrace(JsonElement vector, byte[] bytes)
+    {
+        var reject = vector.TryGetProperty("reject", out var flag) && flag.GetBoolean();
+        if (reject)
+        {
+            Assert.Throws<OtlpExportException>(() =>
+            {
+                foreach (var span in OtlpTraces.Decode(bytes))
+                {
+                    span.ToProducerEvent();
+                }
+            });
+            return;
+        }
+        var events = OtlpTraces.Decode(bytes).Select(span => span.ToProducerEvent()).ToArray();
+        var expected = vector.GetProperty("events").EnumerateArray().ToArray();
+        Assert.Equal(expected.Length, events.Length);
+        for (var index = 0; index < events.Length; index++)
+        {
+            var want = expected[index];
+            Assert.Equal(want.GetProperty("id").GetString(), events[index].Id);
+            Assert.Equal(want.GetProperty("kind").GetString(), events[index].Kind);
+            var sequence = events[index].Sequence;
+            Assert.NotNull(sequence);
+            Assert.Equal(ulong.Parse(want.GetProperty("sequence_epoch").GetString()!), sequence.Epoch);
+            Assert.Equal(ulong.Parse(want.GetProperty("sequence_number").GetString()!), sequence.Sequence);
+            Assert.Equal(
+                want.GetProperty("predecessors").EnumerateArray().Select(item => item.GetString()).ToArray(),
+                events[index].CausalPredecessorIds);
+        }
+    }
+
+    private static void AssertCompleteness(JsonElement vector, byte[] bytes)
+    {
+        var want = vector.GetProperty("completeness");
+        var record = Assert.Single(OtlpLogs.Decode(bytes));
+        Assert.Equal(OtlpLogs.CompletenessType, LogText(record, OtlpLogs.PayloadTypeKey));
+        Assert.Equal(want.GetProperty("source_handle").GetString(), LogText(record, OtlpLogs.SourceHandleKey));
+        Assert.NotNull(record.BodyBytes);
+        var signal = ProducerCompletenessSignal.ParseFrom(record.BodyBytes);
+        Assert.Equal(ulong.Parse(want.GetProperty("sequence_epoch").GetString()!), signal.SequenceEpoch);
+        Assert.Equal(ulong.Parse(want.GetProperty("last_emitted").GetString()!), signal.LastEmitted);
+        Assert.Equal(ulong.Parse(want.GetProperty("complete_through").GetString()!), signal.CompleteThrough);
+        Assert.Equal(ulong.Parse(want.GetProperty("acknowledged_filter_epoch").GetString()!), signal.AcknowledgedFilterEpoch);
+        Assert.NotNull(signal.ProducerReportedAt);
+        Assert.NotNull(signal.ProducerReportedAt.Nanoseconds);
+        Assert.Equal(want.GetProperty("clock_domain_id").GetString(), signal.ProducerReportedAt.ClockDomainId);
+        Assert.Equal(BigInteger.Parse(want.GetProperty("occurrence_ns").GetString()!), Int128Codec.ToBigInteger(signal.ProducerReportedAt.Nanoseconds));
+        Assert.Equal(ulong.Parse(want.GetProperty("uncertainty_nanoseconds").GetString()!), signal.ProducerReportedAt.UncertaintyNanoseconds);
+        Assert.Equal(Activity(want.GetProperty("activity").GetString()!), signal.Activity);
+    }
+
+    private static void AssertVerdict(JsonElement vector, byte[] bytes)
+    {
+        var want = vector.GetProperty("verdict");
+        using var receiver = OtlpLogReceiver.Start();
+        Assert.Equal(200, receiver.Ingest(bytes));
+        var verdict = Assert.Single(receiver.Verdicts);
+        Assert.Equal(want.GetProperty("id").GetString(), verdict.Id);
+        Assert.Equal(Outcome(want.GetProperty("outcome").GetString()!), verdict.Outcome);
+    }
+
+    private static void AssertFilter(JsonElement vector, byte[] bytes)
+    {
+        var want = vector.GetProperty("event_filter");
+        var record = Assert.Single(OtlpLogs.Decode(bytes));
+        Assert.Equal(OtlpLogs.EventFilterType, LogText(record, OtlpLogs.PayloadTypeKey));
+        Assert.NotNull(record.BodyBytes);
+        var filter = EventFilter.ParseFrom(record.BodyBytes);
+        Assert.Equal((ulong?)ulong.Parse(want.GetProperty("epoch").GetString()!), filter.Epoch);
+        Assert.Equal(
+            want.GetProperty("specification_ids").EnumerateArray().Select(item => item.GetString()).ToArray(),
+            filter.Specifications.Select(spec => spec.SpecificationId).ToArray());
+    }
+
+    private static void AssertDecision(JsonElement vector, byte[] bytes)
+    {
+        var want = vector.GetProperty("decide_response");
+        var record = Assert.Single(OtlpLogs.Decode(bytes));
+        Assert.Equal(OtlpLogs.DecideResponseType, LogText(record, OtlpLogs.PayloadTypeKey));
+        Assert.Equal(want.GetProperty("request_id").GetString(), LogText(record, OtlpLogs.RequestIdKey));
+        Assert.NotNull(record.BodyBytes);
+        var decision = DecideResponse.ParseFrom(record.BodyBytes);
+        Assert.Equal(want.GetProperty("request_id").GetString(), decision.RequestId);
+        Assert.Equal(Action(want.GetProperty("action").GetString()!), decision.Action);
+        var specs = want.GetProperty("specifications").EnumerateArray().ToArray();
+        Assert.Equal(specs.Length, decision.Specifications.Count);
+        for (var index = 0; index < specs.Length; index++)
+        {
+            Assert.Equal(specs[index].GetProperty("id").GetString(), decision.Specifications[index].SpecificationId);
+            Assert.Equal(Action(specs[index].GetProperty("action").GetString()!), decision.Specifications[index].Action);
+        }
+    }
+
+    private static byte[] OtlpBytes(string relative)
+    {
+        var name = Path.GetFileName(relative.Replace('/', Path.DirectorySeparatorChar));
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir != null)
+        {
+            var path = Path.Combine(dir.FullName, "testdata", "otlp", name);
+            if (File.Exists(path))
+            {
+                return File.ReadAllBytes(path);
+            }
+            dir = dir.Parent;
+        }
+        throw new FileNotFoundException(relative);
+    }
+
+    private static string? LogText(DecodedLog record, string key)
+    {
+        foreach (var attribute in record.Attributes)
+        {
+            if (attribute.Key == key)
+            {
+                return OtlpTraces.StringOf(attribute.Value);
+            }
+        }
+        return null;
+    }
+
+    private static SourceActivityState Activity(string token) => token switch
+    {
+        "active" => SourceActivityState.SourceActivityStateActive,
+        "idle" => SourceActivityState.SourceActivityStateIntentionallyIdle,
+        _ => throw new InvalidOperationException(token),
+    };
+
+    private static ReceivedVerdictOutcome Outcome(string token) => token switch
+    {
+        "satisfy" => ReceivedVerdictOutcome.Satisfy,
+        "violate" => ReceivedVerdictOutcome.Violate,
+        "inconclusive" => ReceivedVerdictOutcome.Inconclusive,
+        _ => throw new InvalidOperationException(token),
+    };
+
+    private static DecisionAction Action(string token) => token switch
+    {
+        "permit" => DecisionAction.DecisionActionPermit,
+        "deny" => DecisionAction.DecisionActionDeny,
+        "defer" => DecisionAction.DecisionActionDefer,
+        _ => throw new InvalidOperationException(token),
+    };
 }
