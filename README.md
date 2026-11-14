@@ -11,7 +11,7 @@ The SDK:
 - applies attribute-level Filter projection before shipping — relevance, never
   sampling (`Filter/`, ADR-0006)
 - exports ended spans and producer completeness as OTLP/HTTP protobuf, and
-  receives Verdict, EventFilter, and DecideResponse on `127.0.0.1` (`Otlp/`,
+  receives Verdict, EventFilter, and DecideResponse (`Otlp/`, loopback by default and bindable;
   the #398 Probe-wire exception). The gate waits on that log. Connect is not
   the live path.
 - reads source-tier from deployment config (`Config/`, ADR-0022, never hard-coded)
@@ -20,8 +20,14 @@ The SDK:
 
 `OtlpExporter` posts `ExportTraceServiceRequest` bytes to `/v1/traces` and a
 `ProducerCompletenessSignal` log to `/v1/logs`, with `x-sentinel-source-handle`.
-A missing predecessor id fails that export. `OtlpLogReceiver` binds `127.0.0.1`
-and serves `POST /v1/logs`. `harness-probe-sdk-dotnet` builds `sentinel-periphery`
+A missing predecessor id fails that export. `OtlpLogReceiver` serves `POST /v1/logs`; it binds
+`127.0.0.1` on a random port by default, and `OtlpLogReceiver.Start("0.0.0.0", 9300)` (or
+`Start(IPAddress, port)`) lets a containerised Probe receive Event Filters.
+`new OtlpExporter(url, http, resourceAttributes)` sends OTLP **resource** attributes (`service.name`
+and the provenance keys of `platform/probe-config`) with every trace export. They are never span
+attributes, so the eight-key span contract is unchanged. A non-2xx answer throws an
+`OtlpExportException` whose message, `StatusCode` and `ResponseBody` carry Sentinel's reply, and
+whose `IsTransient` is true for no response, timeout, 408, 429 and 5xx. `harness-probe-sdk-dotnet` builds `sentinel-periphery`
 and runs the sample CAT-1 charge/ship round trip against it.
 
 ## Sequence numbers and completeness
@@ -29,12 +35,63 @@ and runs the sample CAT-1 charge/ship round trip against it.
 Create one `Emission.SequenceAllocator` per source and add
 `new SequenceStampingProcessor(sequence)` to the host's TracerProvider. It allocates
 at Activity start and stamps `sentinel.sequence.epoch` and `sentinel.sequence.number`;
-an Activity already carrying both keeps its reserved slot. This SDK has no exporting
-processor: read the slot with `SequenceStampingProcessor.TryGetSlot`, build a
-`SpanExport` using `slot.Epoch` and `slot.Number`, and call
-`OtlpExporter.ExportSpansCheckedAsync`. Mark it exported only on HTTP 2xx with zero
-`partial_success.rejected_spans`; on a refusal, error or undecodable response use
-`sequence.MarkFailed(slot)`. A host Filter drop uses `MarkFiltered(slot, filterEpoch)`.
+an Activity already carrying both keeps its reserved slot. Add `OtlpExportingSpanProcessor` after it: it reads the slot, builds the `SpanExport`, queues it and
+marks the slot (below). A host may still call `OtlpExporter.ExportSpansCheckedAsync` itself: mark the
+slot exported only on HTTP 2xx with zero `partial_success.rejected_spans`; on a refusal, error or
+undecodable response use `sequence.MarkFailed(slot)`. A host Filter drop uses `MarkFiltered(slot, filterEpoch)`.
+
+## Exporting processor
+
+```csharp
+var processor = new OtlpExportingSpanProcessor(new OtlpExportingSpanProcessorOptions
+{
+    SourceHandle = handle, Sequence = sequence, Exporter = exporter, SchemaVersion = "my-schema-v1",
+    Filters = filterStore,
+    AllowUnattributedRemoteParent = true,
+    OnError = f => metrics.Increment(f.Kind.ToString()),
+    Log = Console.Error.WriteLine,
+});
+builder.AddProcessor(new SequenceStampingProcessor(sequence)).AddProcessor(processor);
+// shutdown: dispose the provider, then flush and send the final declaration, in that order
+await processor.ShutdownAsync(heartbeat, ct);
+```
+
+- **Never throws from the span-end path.** A conversion, validation, encode or transport error is
+  caught: the slot is marked FAILED (`complete_through` never advances past it), the error goes to
+  `OnError` (an `ExportFailure` with kind, error and slots) and to a rate-limited `Log`
+  (`LogInterval`, default 10 s). An `OnError` or `Log` that throws is swallowed. A span with no slot is ignored.
+- **Bounded async queue.** One worker exports batches (`MaxBatch` 32). When the queue
+  (`QueueCapacity` 4096) is full the **newest** Event is dropped, its slot is FAILED and
+  `DroppedCount` rises: a dropped Event is missing evidence, never a pass.
+- **Retries.** Transport errors (no response, timeout, HTTP 408/429/5xx) are retried with exponential
+  backoff (`RetryBaseDelay` 250 ms, capped at `RetryMaxDelay`) up to `MaxAttempts` (3), then FAILED.
+  Validation errors, other 4xx answers and `rejected_spans` are deterministic: FAILED at once, not
+  retried. Each Event is validated alone first, so one bad span does not fail its batch.
+- **Shutdown.** `ShutdownAsync(heartbeat)` stops intake, waits until every queued Event is exported
+  or FAILED, then sends the heartbeat's final declaration. `Dispose` only stops intake.
+
+## Remote parents that are not Probes
+
+A span whose remote parent comes from a caller that is not a Probe (a browser, curl, an
+uninstrumented service) carries a `traceparent` but no `sentinel.parent.event.id`. By default the
+export refuses it and its slot stays FAILED. With `AllowUnattributedRemoteParent = true`
+(`SpanConversion`, `SpanExport` and the processor options; default false, as in the Go SDK) it is
+exported as a causal **root**: no predecessor, and no parent span id on the Sentinel copy (the
+periphery refuses a parent span id without a parent Event id; this encoder never writes one). The
+host's own copy keeps its parent span for Tempo. Only a remote parent qualifies: a local parent
+without the id is still refused.
+
+`ProbeActivities.StartEvent(source, name, kind, parent, parentEventId)` starts the Event activity.
+.NET parents to `Activity.Current` whatever context you pass, so the helper clears it around the
+start, then restores it. Without `parent` it uses the ambient activity: a Probe Event
+(`sentinel.event.id` tag) becomes a local parent with its id as `sentinel.parent.event.id`; any
+other ambient span (an inbound request span) becomes a remote parent without one.
+
+`ParentEventPropagation.InjectParentEventId(carrier, eventId)` writes the `x-sentinel-parent-event-id`
+header next to `traceparent`; `ExtractParentEventId(carrier)` reads it, falling back to the
+`sentinel` member of `tracestate` (`sentinel=<eventId>`). Dictionary carriers (case-insensitive),
+`HttpHeaders` and `Inject`/`Extract` with a getter/setter (ASP.NET `IHeaderDictionary`, Kafka headers) are supported.
+Pass the extracted id to `StartEvent` as `parentEventId`.
 
 `Otlp.CompletenessHeartbeat` sends the allocator's declarations on `/v1/logs`:
 
@@ -117,7 +174,7 @@ dotnet test --no-build --no-restore Sentinel.Probe.Sdk.sln
 
 Run the `dotnet` commands from `sdk/dotnet` so SDK discovery uses its `global.json`. All
 three pass on .NET 10.0.302. The test suite uses xUnit, is hermetic at test-execution time
-(ADR-0019: no network, no wall clock), and covers 220 cases mirroring the Go `*_test.go`
+(ADR-0019: no network, no wall clock), and covers 310 cases mirroring the Go `*_test.go`
 files plus the generated-API presence regressions.
 
 ## Key design decisions

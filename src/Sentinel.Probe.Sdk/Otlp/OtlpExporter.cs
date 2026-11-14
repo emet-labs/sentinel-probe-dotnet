@@ -22,14 +22,40 @@ public sealed class OtlpExporter : IDisposable
     private readonly bool _ownsClient;
     private readonly string _tracesUrl;
     private readonly string _logsUrl;
+    private readonly IReadOnlyDictionary<string, string>? _resourceAttributes;
 
-    public OtlpExporter(string sentinelBaseUrl, HttpClient? httpClient = null)
+    /// <summary>Longest response body kept on an <see cref="OtlpExportException"/>.</summary>
+    public const int MaxErrorBodyChars = 2048;
+
+    /// <param name="sentinelBaseUrl">Sentinel periphery base URL.</param>
+    /// <param name="httpClient">Optional client; the exporter does not dispose a supplied one.</param>
+    /// <param name="resourceAttributes">
+    /// OTLP resource attributes sent with every trace export (<c>service.name</c> and the
+    /// provenance keys of platform/probe-config). Resource only: they never become span attributes,
+    /// so the eight-key span contract is unchanged. Keys must be non-empty and unique; values are strings.
+    /// </param>
+    public OtlpExporter(string sentinelBaseUrl, HttpClient? httpClient = null, IReadOnlyDictionary<string, string>? resourceAttributes = null)
     {
         if (string.IsNullOrWhiteSpace(sentinelBaseUrl))
         {
             throw new ArgumentException("Sentinel base URL is required.", nameof(sentinelBaseUrl));
         }
         var root = sentinelBaseUrl.TrimEnd('/');
+        if (resourceAttributes != null)
+        {
+            foreach (var pair in resourceAttributes)
+            {
+                if (string.IsNullOrEmpty(pair.Key))
+                {
+                    throw new ArgumentException("A resource attribute key is empty.", nameof(resourceAttributes));
+                }
+                if (pair.Value == null)
+                {
+                    throw new ArgumentException("Resource attribute " + pair.Key + " has a null value.", nameof(resourceAttributes));
+                }
+            }
+            _resourceAttributes = new Dictionary<string, string>(resourceAttributes, StringComparer.Ordinal);
+        }
         _tracesUrl = root + "/v1/traces";
         _logsUrl = root + "/v1/logs";
         if (httpClient == null)
@@ -46,7 +72,7 @@ public sealed class OtlpExporter : IDisposable
     }
 
     public Task ExportSpansAsync(string sourceHandle, IReadOnlyList<SpanExport> spans, CancellationToken cancellationToken) =>
-        PostAsync(_tracesUrl, sourceHandle, OtlpTraces.Encode(spans), cancellationToken);
+        PostAsync(_tracesUrl, sourceHandle, OtlpTraces.Encode(spans, _resourceAttributes), cancellationToken);
 
     /// <summary>
     /// Posts the spans and returns the rejected span count from Sentinel's
@@ -55,7 +81,7 @@ public sealed class OtlpExporter : IDisposable
     /// </summary>
     public async Task<long> ExportSpansCheckedAsync(string sourceHandle, IReadOnlyList<SpanExport> spans, CancellationToken cancellationToken)
     {
-        var body = await PostAsync(_tracesUrl, sourceHandle, OtlpTraces.Encode(spans), cancellationToken).ConfigureAwait(false);
+        var body = await PostAsync(_tracesUrl, sourceHandle, OtlpTraces.Encode(spans, _resourceAttributes), cancellationToken).ConfigureAwait(false);
         try
         {
             return PartialSuccess.RejectedSpans(body);
@@ -98,15 +124,34 @@ public sealed class OtlpExporter : IDisposable
         }
         catch (Exception ex)
         {
-            throw new OtlpExportException("OTLP export failed", ex);
+            throw new OtlpExportException("OTLP export failed: " + ex.Message, ex) { IsTransient = true };
         }
         using (response)
         {
             if (!response.IsSuccessStatusCode)
             {
-                var text = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                var code = (int)response.StatusCode;
+                string text;
+                try
+                {
+                    text = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    text = "";
+                }
+                if (text.Length > MaxErrorBodyChars)
+                {
+                    text = text.Substring(0, MaxErrorBodyChars) + "...";
+                }
+                var summary = text.Length == 0 ? "" : ": " + text;
                 throw new OtlpExportException(
-                    "OTLP export was rejected: HTTP " + ((int)response.StatusCode).ToString(System.Globalization.CultureInfo.InvariantCulture) + " " + text);
+                    "OTLP export was rejected: HTTP " + code.ToString(System.Globalization.CultureInfo.InvariantCulture) + " " + response.ReasonPhrase + summary)
+                {
+                    StatusCode = code,
+                    ResponseBody = text,
+                    IsTransient = code == 408 || code == 429 || code >= 500,
+                };
             }
             return await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
         }

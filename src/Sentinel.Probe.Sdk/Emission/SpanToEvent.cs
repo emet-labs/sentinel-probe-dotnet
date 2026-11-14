@@ -68,6 +68,13 @@ public sealed class SpanConversion
     /// export. The span id is not passed here and is not stored as causality.
     /// </summary>
     public Action<string, string>? OnMalformedLink { get; init; }
+
+    /// <summary>
+    /// When true, an activity whose REMOTE parent carries no <c>sentinel.parent.event.id</c> (the
+    /// caller is not a Probe: a browser, curl, an uninstrumented service) converts as a causal
+    /// root with no predecessor. A local parent without the id is still refused. Default false.
+    /// </summary>
+    public bool AllowUnattributedRemoteParent { get; init; }
 }
 
 public static class SpanToEventConverter
@@ -91,7 +98,7 @@ public static class SpanToEventConverter
             Attributes = { MapAttributes(activity.TagObjects) },
             ClaimedCapabilities = { conversion.ClaimedCapabilities },
             ClaimedSensitivity = conversion.ClaimedSensitivity,
-            CausalPredecessorIds = { CollectCausalPredecessors(activity) },
+            CausalPredecessorIds = { CollectCausalPredecessors(activity, conversion.AllowUnattributedRemoteParent) },
         };
         // proto3 `optional`: a null acknowledged epoch stays absent rather than becoming 0.
         @event.SetAcknowledgedFilterEpoch(conversion.AcknowledgedEpoch);
@@ -201,7 +208,7 @@ public static class SpanToEventConverter
     /// Reads the parent edge and every link edge, in that order. A parent span or a link
     /// without <c>sentinel.event.id</c> fails the export. The span id is not a predecessor.
     /// </summary>
-    private static List<string> CollectCausalPredecessors(Activity activity)
+    private static List<string> CollectCausalPredecessors(Activity activity, bool allowUnattributedRemoteParent)
     {
         var predecessors = new List<string>();
 
@@ -210,7 +217,7 @@ public static class SpanToEventConverter
         {
             predecessors.Add(parentEventId);
         }
-        else if (activity.ParentSpanId != default)
+        else if (activity.ParentSpanId != default && !IsUnattributedRemoteParentAllowed(activity, allowUnattributedRemoteParent))
         {
             throw new OtlpExportException("parent span is missing sentinel.parent.event.id");
         }
@@ -228,6 +235,13 @@ public static class SpanToEventConverter
 
         return predecessors;
     }
+
+    /// <summary>
+    /// True when <paramref name="allow"/> is set and the activity's parent is remote, so a missing
+    /// <c>sentinel.parent.event.id</c> means "the caller is not a Probe" rather than a contract bug.
+    /// </summary>
+    internal static bool IsUnattributedRemoteParentAllowed(Activity activity, bool allow) =>
+        allow && activity.HasRemoteParent;
 
     /// <summary>
     /// Returns the value of key when it is present AND holds a string. A non-string value under a

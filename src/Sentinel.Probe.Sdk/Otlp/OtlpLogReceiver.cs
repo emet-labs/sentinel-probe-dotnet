@@ -14,7 +14,8 @@ using Google.Protobuf;
 namespace Sentinel.Probe.Sdk.Otlp;
 
 /// <summary>
-/// Serves <c>POST /v1/logs</c> on <c>127.0.0.1</c>. Accepts identity and gzip
+/// Serves <c>POST /v1/logs</c> on a configurable address (default <c>127.0.0.1</c>, random port;
+/// bind <c>0.0.0.0</c> and a fixed port so a containerised Probe can receive Event Filters). Accepts identity and gzip
 /// <c>application/x-protobuf</c> and decodes Verdict, EventFilter, and DecideResponse.
 /// An unspecified decision action is an error and is not delivered to the gate.
 /// </summary>
@@ -32,24 +33,75 @@ public sealed class OtlpLogReceiver : IDisposable
     private readonly Dictionary<string, TaskCompletionSource<DecideResponse>> _waiters = new(StringComparer.Ordinal);
     private volatile bool _stop;
 
-    public string LogsUrl => "http://127.0.0.1:" + _port.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/v1/logs";
+    /// <summary>
+    /// A URL that reaches this receiver from the same host: the bound address, or loopback when the
+    /// receiver listens on a wildcard address. A peer in another container needs its own name for it.
+    /// </summary>
+    public string LogsUrl
+    {
+        get
+        {
+            var host = BoundAddress;
+            if (host.Equals(IPAddress.Any) || host.Equals(IPAddress.IPv6Any))
+            {
+                host = host.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Loopback : IPAddress.Loopback;
+            }
+            var text = host.AddressFamily == AddressFamily.InterNetworkV6 ? "[" + host + "]" : host.ToString();
+            return "http://" + text + ":" + _port.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/v1/logs";
+        }
+    }
+
+    /// <summary>The address the receiver is bound to.</summary>
+    public IPAddress BoundAddress { get; }
 
     public int Port => _port;
 
-    private OtlpLogReceiver(TcpListener listener, int port)
+    private OtlpLogReceiver(TcpListener listener, IPAddress address, int port)
     {
         _listener = listener;
+        BoundAddress = address;
         _port = port;
         _thread = new Thread(Serve) { IsBackground = true, Name = "sentinel-otlp-logs" };
         _thread.Start();
     }
 
-    public static OtlpLogReceiver Start()
+    /// <summary>Starts a receiver on loopback and a random port.</summary>
+    public static OtlpLogReceiver Start() => Start(IPAddress.Loopback, 0);
+
+    /// <summary>
+    /// Starts a receiver on <paramref name="host"/> (an IP literal such as <c>0.0.0.0</c> or
+    /// <c>::</c>, or a name that resolves to one) and <paramref name="port"/> (0 picks a free port).
+    /// </summary>
+    public static OtlpLogReceiver Start(string host, int port)
     {
-        var listener = new TcpListener(IPAddress.Loopback, 0);
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            throw new ArgumentException("Bind host is required.", nameof(host));
+        }
+        if (IPAddress.TryParse(host, out var address))
+        {
+            return Start(address, port);
+        }
+        var resolved = Dns.GetHostAddresses(host);
+        if (resolved.Length == 0)
+        {
+            throw new ArgumentException("Bind host " + host + " did not resolve.", nameof(host));
+        }
+        return Start(resolved[0], port);
+    }
+
+    /// <summary>Starts a receiver bound to <paramref name="address"/> and <paramref name="port"/>.</summary>
+    public static OtlpLogReceiver Start(IPAddress address, int port)
+    {
+        ArgumentNullException.ThrowIfNull(address);
+        if (port < 0 || port > 65535)
+        {
+            throw new ArgumentOutOfRangeException(nameof(port), "Port must be 0..65535.");
+        }
+        var listener = new TcpListener(address, port);
         listener.Start();
-        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        return new OtlpLogReceiver(listener, port);
+        var bound = ((IPEndPoint)listener.LocalEndpoint).Port;
+        return new OtlpLogReceiver(listener, address, bound);
     }
 
     /// <summary>

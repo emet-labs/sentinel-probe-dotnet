@@ -22,6 +22,13 @@ public sealed class SpanExport
     public required ulong AcknowledgedFilterEpoch { get; init; }
     public Sensitivity ClaimedSensitivity { get; init; } = Sensitivity.Unspecified;
     public IReadOnlyList<SourceCapability> ClaimedCapabilities { get; init; } = Array.Empty<SourceCapability>();
+
+    /// <summary>
+    /// A span whose remote parent carries no <c>sentinel.parent.event.id</c> (a caller that is not a
+    /// Probe) is exported as a causal root: no predecessor, and no parent span id on the wire.
+    /// Default false. A local parent without the id is still refused.
+    /// </summary>
+    public bool AllowUnattributedRemoteParent { get; init; }
 }
 
 /// <summary>An attribute read back from an OTLP span or log record.</summary>
@@ -105,7 +112,13 @@ public static class OtlpTraces
     public const string SensitivityKey = "sentinel.claimed_sensitivity";
     public const string CapabilitiesKey = "sentinel.claimed_capabilities";
 
-    public static byte[] Encode(IReadOnlyList<SpanExport> spans)
+    public static byte[] Encode(IReadOnlyList<SpanExport> spans) => Encode(spans, null);
+
+    /// <summary>
+    /// Encodes an ExportTraceServiceRequest. <paramref name="resourceAttributes"/> become the
+    /// OTLP Resource's attributes (never span attributes).
+    /// </summary>
+    public static byte[] Encode(IReadOnlyList<SpanExport> spans, IReadOnlyDictionary<string, string>? resourceAttributes)
     {
         // ScopeSpans.spans is repeated. Each ended span is its own length-delimited
         // field. One field whose payload is several span bodies is not an export:
@@ -116,8 +129,19 @@ public static class OtlpTraces
             repeatedSpans.Add(LengthDelimited(2, new[] { EncodeSpan(span) }));
         }
         var scope = Concat(repeatedSpans);
-        var resource = LengthDelimited(2, new[] { scope });
-        return LengthDelimited(1, new[] { resource });
+        var parts = new List<byte[]>();
+        if (resourceAttributes is { Count: > 0 })
+        {
+            var attributes = new List<byte[]>(resourceAttributes.Count);
+            foreach (var pair in resourceAttributes)
+            {
+                attributes.Add(LengthDelimited(1, new[] { Attribute(pair.Key, StringValue(pair.Value)) }));
+            }
+            // ResourceSpans.resource (field 1) holds Resource.attributes (field 1).
+            parts.Add(LengthDelimited(1, new[] { Concat(attributes) }));
+        }
+        parts.Add(LengthDelimited(2, new[] { scope }));
+        return LengthDelimited(1, new[] { Concat(parts) });
     }
 
     public static IReadOnlyList<DecodedSpan> Decode(byte[] export)
@@ -134,6 +158,23 @@ public static class OtlpTraces
             }
         }
         return spans;
+    }
+
+    /// <summary>Reads the OTLP Resource attributes of an export (test and diagnostic use).</summary>
+    internal static IReadOnlyList<DecodedAttribute> DecodeResourceAttributes(byte[] export)
+    {
+        var attributes = new List<DecodedAttribute>();
+        foreach (var resourceSpans in ReadRepeated(export, 1))
+        {
+            foreach (var resource in ReadRepeated(resourceSpans, 1))
+            {
+                foreach (var attribute in ReadRepeated(resource, 1))
+                {
+                    attributes.Add(ReadAttribute(attribute));
+                }
+            }
+        }
+        return attributes;
     }
 
     internal static ProducerEvent ToProducerEvent(DecodedSpan span)
@@ -305,15 +346,18 @@ public static class OtlpTraces
             AcknowledgedEpoch = export.AcknowledgedFilterEpoch,
             ClaimedCapabilities = export.ClaimedCapabilities.ToList(),
             ClaimedSensitivity = export.ClaimedSensitivity,
+            AllowUnattributedRemoteParent = export.AllowUnattributedRemoteParent,
         });
         RejectContract(export);
         var domain = CollectDomain(activity.TagObjects);
         RejectActivityAnnotations(activity);
         string? parent = ParentEventId(activity);
-        if (HasParentSpan(activity) && parent == null)
+        if (HasParentSpan(activity) && parent == null && !SpanToEventConverter.IsUnattributedRemoteParentAllowed(activity, export.AllowUnattributedRemoteParent))
         {
             throw new OtlpExportException("parent span is missing sentinel.parent.event.id");
         }
+        // The parent span id is never written (no field 4 below): Sentinel refuses a span that names
+        // a parent span id without a parent Event id, so an allowed unattributed remote parent is a root.
         var links = EncodeLinks(activity);
 
         var attributes = new List<byte[]>
