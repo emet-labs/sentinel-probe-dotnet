@@ -34,7 +34,7 @@ once. On `TimeProvider.System` the timer counts whole milliseconds, so a budget 
 and the provenance keys of `platform/probe-config`) with every trace export. They are never span
 attributes, so the eight-key span contract is unchanged. A non-2xx answer throws an
 `OtlpExportException` whose message, `StatusCode` and `ResponseBody` carry Sentinel's reply, and
-whose `IsTransient` is true for no response, timeout, 408, 429 and 5xx. `harness-probe-sdk-dotnet` builds `sentinel-periphery`
+whose `IsTransient` is true for no response, timeout, and HTTP 408, 425, 429, 500, 502, 503 and 504. `harness-probe-sdk-dotnet` builds `sentinel-periphery`
 and runs the sample CAT-1 charge/ship round trip against it.
 
 ## Sequence numbers and completeness
@@ -70,9 +70,11 @@ await processor.ShutdownAsync(heartbeat, ct);
 - **Bounded async queue.** One worker exports batches (`MaxBatch` 32). When the queue
   (`QueueCapacity` 4096) is full the **newest** Event is dropped, its slot is FAILED and
   `DroppedCount` rises: a dropped Event is missing evidence, never a pass.
-- **Retries.** Transport errors (no response, timeout, HTTP 408/429/5xx) are retried with exponential
-  backoff (`RetryBaseDelay` 250 ms, capped at `RetryMaxDelay`) up to `MaxAttempts` (3), then FAILED.
-  Validation errors, other 4xx answers and `rejected_spans` are deterministic: FAILED at once, not
+- **Retries.** The Probe SDK retry policy ([`../README.md`](../README.md)): transport errors (no
+  response, timeout) and HTTP 408, 425, 429, 500, 502, 503 and 504 are retried with exponential
+  backoff and jitter (`RetryBaseDelay` 100 ms, capped at `RetryMaxDelay` 5 s, a `Retry-After` on a
+  429 or 503 honored within the cap) up to `MaxAttempts` (5), then FAILED.
+  Validation errors, every other status and `rejected_spans` are deterministic: FAILED at once, not
   retried. Each Event is validated alone first, so one bad span does not fail its batch, and a
   batch Sentinel rejects is resent one Event at a time so a refusal fails only the Event it names.
 - **Duplicate Event id.** When Sentinel refuses a second delivery of an Event id it holds

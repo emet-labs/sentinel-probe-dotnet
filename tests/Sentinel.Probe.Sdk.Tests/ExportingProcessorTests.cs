@@ -75,7 +75,9 @@ public class ExportingProcessorTests
             Action<string>? log = null,
             FilterStore? filters = null,
             TimeProvider? time = null,
-            IReadOnlyDictionary<string, string>? resource = null)
+            IReadOnlyDictionary<string, string>? resource = null,
+            List<TimeSpan>? delays = null,
+            Func<double>? jitter = null)
         {
             Http = http;
             _exporter = new OtlpExporter("http://sentinel.invalid", new HttpClient(http), resource);
@@ -101,7 +103,12 @@ public class ExportingProcessorTests
                     log?.Invoke(m);
                 },
                 TimeProvider = time,
-                Delay = (_, _) => Task.CompletedTask,
+                Delay = (d, _) =>
+                {
+                    delays?.Add(d);
+                    return Task.CompletedTask;
+                },
+                Jitter = jitter,
             });
         }
 
@@ -416,9 +423,117 @@ public class ExportingProcessorTests
         using var rig = new Rig(handler);
         rig.Emit();
         await rig.Processor.ShutdownAsync();
-        Assert.Equal(3, handler.Calls);
+        Assert.Equal(5, handler.Calls);
         Assert.Equal(0UL, rig.Declaration.CompleteThrough);
         Assert.Equal(ExportFailureKind.Transport, rig.Failures.Single().Kind);
+    }
+
+    [Theory]
+    [InlineData(408)]
+    [InlineData(425)]
+    [InlineData(429)]
+    [InlineData(500)]
+    [InlineData(502)]
+    [InlineData(503)]
+    [InlineData(504)]
+    public async Task every_retryable_status_is_retried_then_succeeds(int status)
+    {
+        var handler = new Handler((_, n) => Task.FromResult(new HttpResponseMessage(n < 3 ? (HttpStatusCode)status : HttpStatusCode.OK)
+        {
+            Content = new ByteArrayContent(Array.Empty<byte>()),
+        }));
+        using var rig = new Rig(handler);
+        rig.Emit();
+        await rig.Processor.ShutdownAsync();
+        Assert.Equal(3, handler.Calls);
+        Assert.Equal(1UL, rig.Declaration.CompleteThrough);
+        Assert.Empty(rig.Failures);
+    }
+
+    [Theory]
+    [InlineData(400)]
+    [InlineData(401)]
+    [InlineData(403)]
+    [InlineData(404)]
+    [InlineData(409)]
+    [InlineData(413)]
+    [InlineData(422)]
+    [InlineData(501)]
+    public async Task every_other_status_is_final(int status)
+    {
+        var handler = Handler.Status((HttpStatusCode)status, "no");
+        using var rig = new Rig(handler);
+        rig.Emit();
+        await rig.Processor.ShutdownAsync();
+        Assert.Equal(1, handler.Calls);
+        Assert.Equal(0UL, rig.Declaration.CompleteThrough);
+        Assert.Equal(ExportFailureKind.Refused, rig.Failures.Single().Kind);
+    }
+
+    [Fact]
+    public async Task a_retryable_status_that_outlasts_the_attempts_fails_the_slot()
+    {
+        var handler = Handler.Status(HttpStatusCode.ServiceUnavailable, "busy");
+        using var rig = new Rig(handler);
+        rig.Emit();
+        await rig.Processor.ShutdownAsync();
+        Assert.Equal(5, handler.Calls);
+        Assert.Equal(0UL, rig.Declaration.CompleteThrough);
+        Assert.Equal(ExportFailureKind.Transport, rig.Failures.Single().Kind);
+    }
+
+    [Fact]
+    public void the_defaults_are_the_standard_retry_policy()
+    {
+        using var exporter = new OtlpExporter("http://sentinel.invalid", new HttpClient(Handler.Status(HttpStatusCode.OK)));
+        var options = new OtlpExportingSpanProcessorOptions
+        {
+            SourceHandle = "svc",
+            Sequence = new SequenceAllocator(),
+            Exporter = exporter,
+            SchemaVersion = "v1",
+        };
+        Assert.Equal(5, options.MaxAttempts);
+        Assert.Equal(TimeSpan.FromMilliseconds(100), options.RetryBaseDelay);
+        Assert.Equal(TimeSpan.FromSeconds(5), options.RetryMaxDelay);
+    }
+
+    [Fact]
+    public void the_retry_delay_is_exponential_with_jitter_capped_and_honors_retry_after()
+    {
+        var b = TimeSpan.FromMilliseconds(100);
+        var cap = TimeSpan.FromSeconds(5);
+        Assert.Equal(new[] { 100.0, 200.0, 400.0, 800.0 }, new[] { 1, 2, 3, 4 }.Select(n => OtlpExportingSpanProcessor.RetryDelay(n, b, cap, null, 1.0).TotalMilliseconds));
+        Assert.Equal(new[] { 50.0, 100.0, 200.0, 400.0 }, new[] { 1, 2, 3, 4 }.Select(n => OtlpExportingSpanProcessor.RetryDelay(n, b, cap, null, 0.0).TotalMilliseconds));
+        Assert.Equal(5000.0, OtlpExportingSpanProcessor.RetryDelay(30, b, cap, null, 1.0).TotalMilliseconds);
+        Assert.Equal(2000.0, OtlpExportingSpanProcessor.RetryDelay(1, b, cap, TimeSpan.FromSeconds(2), 0.5).TotalMilliseconds);
+        Assert.Equal(5000.0, OtlpExportingSpanProcessor.RetryDelay(1, b, cap, TimeSpan.FromHours(1), 0.5).TotalMilliseconds);
+    }
+
+    [Theory]
+    [InlineData(429, "2", 2000.0)]
+    [InlineData(503, "3600", 5000.0)]
+    [InlineData(500, "4", 100.0)]
+    public async Task retry_after_is_honored_on_429_and_503_and_capped(int status, string retryAfter, double expectedMs)
+    {
+        var handler = new Handler((_, n) =>
+        {
+            var response = new HttpResponseMessage(n == 1 ? (HttpStatusCode)status : HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(Array.Empty<byte>()),
+            };
+            if (n == 1)
+            {
+                response.Headers.TryAddWithoutValidation("Retry-After", retryAfter);
+            }
+            return Task.FromResult(response);
+        });
+        var delays = new List<TimeSpan>();
+        using var rig = new Rig(handler, delays: delays, jitter: () => 1.0);
+        rig.Emit();
+        await rig.Processor.ShutdownAsync();
+        Assert.Equal(expectedMs, Assert.Single(delays).TotalMilliseconds);
+        Assert.Equal(1UL, rig.Declaration.CompleteThrough);
     }
 
     [Fact]

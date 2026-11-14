@@ -22,9 +22,12 @@ namespace Sentinel.Probe.Sdk.Emission;
 //   * A bounded channel feeds one worker that exports batches. OVERFLOW POLICY: when the queue is
 //     full the NEWEST Event is dropped (never a queued one), its slot is marked FAILED and counted in
 //     DroppedCount. A dropped Event is therefore visible as missing evidence, never as a pass.
-//   * Transport errors (no response, timeout, HTTP 408/429/5xx) are retried with exponential backoff
-//     up to MaxAttempts, then FAILED. A deterministic refusal (validation, other 4xx, rejected spans)
-//     is FAILED at once: resending the same Events cannot change it.
+//   * RETRY POLICY (the same in every Probe SDK, sdk/README.md): transport errors (no response,
+//     timeout) and HTTP 408, 425, 429, 500, 502, 503 and 504 are retried with exponential backoff and
+//     jitter up to MaxAttempts, then FAILED. A Retry-After on a 429 or 503 raises the wait, never past
+//     RetryMaxDelay. A deterministic refusal (validation, any other status, rejected spans) is FAILED
+//     at once: resending the same Events cannot change it. A slot is marked EXPORTED only after a 2xx
+//     with zero rejected spans, so complete_through never passes a failed or in-flight export.
 //   * DUPLICATE EVENT ID POLICY: when Sentinel refuses a second delivery of an Event id it holds
 //     (evidence_conflict / identity_conflict), OnError receives ExportFailureKind.DuplicateEventId
 //     (reason "duplicate-event-id"), the slot stays FAILED, complete_through never passes it (missing
@@ -115,14 +118,23 @@ public sealed class OtlpExportingSpanProcessorOptions
     /// <summary>Most Events per request. Default 32.</summary>
     public int MaxBatch { get; init; } = 32;
 
-    /// <summary>Attempts per batch, first try included. Default 3.</summary>
-    public int MaxAttempts { get; init; } = 3;
+    /// <summary>
+    /// Attempts per batch, first try included. Retried on a transport error and on HTTP 408, 425,
+    /// 429, 500, 502, 503 and 504; any other status is final. Default 5.
+    /// </summary>
+    public int MaxAttempts { get; init; } = 5;
 
-    /// <summary>Backoff before the second attempt; it doubles each attempt. Default 250 ms.</summary>
-    public TimeSpan RetryBaseDelay { get; init; } = TimeSpan.FromMilliseconds(250);
+    /// <summary>
+    /// Backoff before the second attempt; it doubles each attempt, with jitter (50-100% of the
+    /// step). Default 100 ms.
+    /// </summary>
+    public TimeSpan RetryBaseDelay { get; init; } = TimeSpan.FromMilliseconds(100);
 
-    /// <summary>Longest backoff. Default 5 s.</summary>
+    /// <summary>Longest wait before a retry, a server <c>Retry-After</c> included. Default 5 s.</summary>
     public TimeSpan RetryMaxDelay { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>Source of jitter in [0, 1); tests replace it. Default <see cref="Random.Shared"/>.</summary>
+    public Func<double>? Jitter { get; init; }
 
     /// <summary>Called for every failure. An exception it throws is swallowed.</summary>
     public Action<ExportFailure>? OnError { get; init; }
@@ -445,17 +457,27 @@ public sealed class OtlpExportingSpanProcessor : BaseProcessor<Activity>
                 last = e;
                 if (attempt < _options.MaxAttempts)
                 {
-                    await _delay(Backoff(attempt), CancellationToken.None).ConfigureAwait(false);
+                    await _delay(Backoff(attempt, (e as OtlpExportException)?.RetryAfter), CancellationToken.None).ConfigureAwait(false);
                 }
             }
         }
         Fail(Slots(good), ExportFailureKind.Transport, last ?? new OtlpExportException("export failed"));
     }
 
-    private TimeSpan Backoff(int attempt)
+    private TimeSpan Backoff(int attempt, TimeSpan? retryAfter) =>
+        RetryDelay(attempt, _options.RetryBaseDelay, _options.RetryMaxDelay, retryAfter, (_options.Jitter ?? Random.Shared.NextDouble)());
+
+    /// <summary>
+    /// The wait after failed attempt <paramref name="attempt"/> (1-based): exponential with jitter
+    /// (50-100% of the step; <paramref name="jitter"/> is in [0, 1)), raised to the server's
+    /// Retry-After when that asks for longer, and never longer than <paramref name="cap"/>.
+    /// </summary>
+    internal static TimeSpan RetryDelay(int attempt, TimeSpan baseDelay, TimeSpan cap, TimeSpan? retryAfter, double jitter)
     {
-        var ms = _options.RetryBaseDelay.TotalMilliseconds * Math.Pow(2, attempt - 1);
-        return TimeSpan.FromMilliseconds(Math.Min(ms, _options.RetryMaxDelay.TotalMilliseconds));
+        var step = Math.Min(baseDelay.TotalMilliseconds * Math.Pow(2, attempt - 1), cap.TotalMilliseconds);
+        var jittered = step * (0.5 + (jitter / 2));
+        var wait = Math.Max(jittered, retryAfter?.TotalMilliseconds ?? 0);
+        return TimeSpan.FromMilliseconds(Math.Min(wait, cap.TotalMilliseconds));
     }
 
     private static Slot[] Slots(List<Item> items)

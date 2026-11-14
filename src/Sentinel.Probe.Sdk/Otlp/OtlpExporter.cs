@@ -157,10 +157,35 @@ public sealed class OtlpExporter : IDisposable
                 {
                     StatusCode = code,
                     ResponseBody = text,
-                    IsTransient = code == 408 || code == 429 || code >= 500,
+                    IsTransient = OtlpExportException.IsRetryableStatus(code),
+                    RetryAfter = RetryAfterOf(code, response),
                 };
             }
             return await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    // Retry-After (delta-seconds or an HTTP-date), honored on 429 and 503 only.
+    private static TimeSpan? RetryAfterOf(int code, HttpResponseMessage response)
+    {
+        if (code != 429 && code != 503)
+        {
+            return null;
+        }
+        var header = response.Headers.RetryAfter;
+        if (header is null)
+        {
+            return null;
+        }
+        if (header.Delta is { } delta)
+        {
+            return delta < TimeSpan.Zero ? TimeSpan.Zero : delta;
+        }
+        if (header.Date is { } date)
+        {
+            var wait = date - DateTimeOffset.UtcNow;
+            return wait < TimeSpan.Zero ? TimeSpan.Zero : wait;
+        }
+        return null;
     }
 }
