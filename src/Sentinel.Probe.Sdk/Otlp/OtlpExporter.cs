@@ -48,6 +48,24 @@ public sealed class OtlpExporter : IDisposable
     public Task ExportSpansAsync(string sourceHandle, IReadOnlyList<SpanExport> spans, CancellationToken cancellationToken) =>
         PostAsync(_tracesUrl, sourceHandle, OtlpTraces.Encode(spans), cancellationToken);
 
+    /// <summary>
+    /// Posts the spans and returns the rejected span count from Sentinel's
+    /// ExportTraceServiceResponse (<see cref="PartialSuccess"/>). The export succeeded only when it
+    /// returns 0. A non-2xx status or an undecodable 2xx body throws <see cref="OtlpExportException"/>.
+    /// </summary>
+    public async Task<long> ExportSpansCheckedAsync(string sourceHandle, IReadOnlyList<SpanExport> spans, CancellationToken cancellationToken)
+    {
+        var body = await PostAsync(_tracesUrl, sourceHandle, OtlpTraces.Encode(spans), cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return PartialSuccess.RejectedSpans(body);
+        }
+        catch (FormatException ex)
+        {
+            throw new OtlpExportException("OTLP export returned an undecodable response", ex);
+        }
+    }
+
     public Task ExportCompletenessAsync(string sourceHandle, ProducerCompletenessSignal signal, CancellationToken cancellationToken) =>
         PostAsync(_logsUrl, sourceHandle, OtlpLogs.EncodeCompleteness(sourceHandle, signal), cancellationToken);
 
@@ -59,7 +77,7 @@ public sealed class OtlpExporter : IDisposable
         }
     }
 
-    private async Task PostAsync(string url, string sourceHandle, byte[] body, CancellationToken cancellationToken)
+    private async Task<byte[]> PostAsync(string url, string sourceHandle, byte[] body, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(sourceHandle))
         {
@@ -90,6 +108,7 @@ public sealed class OtlpExporter : IDisposable
                 throw new OtlpExportException(
                     "OTLP export was rejected: HTTP " + ((int)response.StatusCode).ToString(System.Globalization.CultureInfo.InvariantCulture) + " " + text);
             }
+            return await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 }

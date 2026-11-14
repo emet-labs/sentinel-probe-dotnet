@@ -46,16 +46,16 @@ public class ConformanceVectorsTests
     [Fact]
     public void ManifestSuiteRegistryFailsClosed()
     {
-        using var manifest = Load("manifest-v1.json", "1.1.0");
+        using var manifest = Load("manifest-v1.json", "1.3.0");
         var kinds = manifest.RootElement.GetProperty("suites").EnumerateArray()
             .Select(entry => entry.GetProperty("kind").GetString()).ToArray();
-        Assert.Equal(new[] { "spec_match", "int128", "enforcement_gate", "otlp_signal" }, kinds);
+        Assert.Equal(new[] { "spec_match", "int128", "enforcement_gate", "otlp_signal", "sequence_completeness" }, kinds);
     }
 
     [Fact]
     public void SharedMalformedCorpusIsRejectedByCategory()
     {
-        using var manifest = Load("manifest-v1.json", "1.1.0");
+        using var manifest = Load("manifest-v1.json", "1.3.0");
         foreach (var fixture in manifest.RootElement.GetProperty("malformed").EnumerateArray())
         {
             var path = fixture.GetProperty("path").GetString()!;

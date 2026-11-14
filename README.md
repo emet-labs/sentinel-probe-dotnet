@@ -24,6 +24,58 @@ A missing predecessor id fails that export. `OtlpLogReceiver` binds `127.0.0.1`
 and serves `POST /v1/logs`. `harness-probe-sdk-dotnet` builds `sentinel-periphery`
 and runs the sample CAT-1 charge/ship round trip against it.
 
+## Sequence numbers and completeness
+
+Create one `Emission.SequenceAllocator` per source and add
+`new SequenceStampingProcessor(sequence)` to the host's TracerProvider. It allocates
+at Activity start and stamps `sentinel.sequence.epoch` and `sentinel.sequence.number`;
+an Activity already carrying both keeps its reserved slot. This SDK has no exporting
+processor: read the slot with `SequenceStampingProcessor.TryGetSlot`, build a
+`SpanExport` using `slot.Epoch` and `slot.Number`, and call
+`OtlpExporter.ExportSpansCheckedAsync`. Mark it exported only on HTTP 2xx with zero
+`partial_success.rejected_spans`; on a refusal, error or undecodable response use
+`sequence.MarkFailed(slot)`. A host Filter drop uses `MarkFiltered(slot, filterEpoch)`.
+
+`Otlp.CompletenessHeartbeat` sends the allocator's declarations on `/v1/logs`:
+
+```csharp
+using var heartbeat = new CompletenessHeartbeat(
+    sequence,
+    (signal, ct) => exporter.ExportCompletenessAsync(sourceHandle, signal, ct),
+    filterEpoch: filterStore.Epoch);
+heartbeat.Start();
+```
+
+The default interval is 15 seconds; `interval` accepts 1 s to 59.999 s or
+`TimeSpan.Zero` for `ReportAsync` only. `timeProvider` and `send` inject time,
+scheduling and transport. An absent Filter is acknowledged as epoch 0.
+`DeclareIdle()` declares intentional idle; the next allocation or `DeclareActive()`
+makes the source active again.
+
+`last_emitted` is the highest allocated number; `complete_through` advances only over
+the contiguous successfully exported prefix. In-flight, failed and Filter-dropped
+slots keep the boundary open, preserving Inconclusive instead of inventing evidence.
+Filtered ranges retain the Filter epoch for #542, but are not yet declared on the
+wire and do not advance completeness. The allocator does not retry exports.
+
+Equal counters declare an epoch closed. The allocator seals it, and the next
+allocation opens `max(previous epoch + 1, current Unix milliseconds)`. The heartbeat
+restates the previous epoch's final declaration before the new one until accepted
+under the current Filter epoch. Only the epoch current at Filter publication can
+settle Authoritative; Events straddling a source's epoch roll may leave their Binding
+Inconclusive.
+
+A restart needs a strictly greater epoch. Unix milliseconds are the default; if the
+clock can step backwards, persist the last epoch and pass `previousEpoch` to the
+allocator. A clock-derived epoch then advances past it, while an explicit `epoch`
+that is not greater is refused. Without persistence Sentinel refuses a regression
+with HTTP 409.
+
+`Stop()` cancels scheduling and sends nothing further. `ShutdownAsync()` waits for
+a running report and sends a final declaration, which closes only if every allocated
+slot was exported. Let exports settle before `ShutdownAsync()` on a clean exit;
+`Dispose()` silences the heartbeat without a final send.
+
 ## Generated proto types
 
 The C# proto types under `src/Sentinel.Probe.Sdk/gen/` are protoc-gen-csharp output
