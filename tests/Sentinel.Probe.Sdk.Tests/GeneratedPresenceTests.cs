@@ -40,11 +40,12 @@ public class GeneratedPresenceTests
     }
 
     [Fact]
-    public void SetEpochLessOverEpochZeroHeldFilterUpdates()
+    public void SetEpochLessOverEpochZeroHeldFilterIsRefused()
     {
+        // Epoch 0 is a present epoch, so an epoch-less Filter never replaces it (#464).
         var store = new FilterStore(new EventFilter { Epoch = 0 });
-        Assert.True(store.Set(new EventFilter()));
-        Assert.Null(store.Epoch());
+        Assert.False(store.Set(new EventFilter()));
+        Assert.Equal(0UL, store.Epoch());
     }
 
     [Fact]

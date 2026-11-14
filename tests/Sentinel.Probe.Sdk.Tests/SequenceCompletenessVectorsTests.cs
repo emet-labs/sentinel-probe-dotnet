@@ -27,7 +27,7 @@ public class SequenceCompletenessVectorsTests
     private static List<JsonElement> Cases()
     {
         var manifest = Read("manifest-v1.json");
-        Assert.Equal("1.3.0", manifest.GetProperty("format_version").GetString());
+        Assert.Equal("1.4.0", manifest.GetProperty("format_version").GetString());
         var entry = Assert.Single(manifest.GetProperty("suites").EnumerateArray(),
             suite => suite.GetProperty("kind").GetString() == "sequence_completeness");
         var document = Read(entry.GetProperty("path").GetString()!);

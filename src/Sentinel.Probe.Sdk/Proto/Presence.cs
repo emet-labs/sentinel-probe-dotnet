@@ -23,6 +23,10 @@ internal static class Presence
     internal static ulong? LatencyBudgetNanosecondsOrNull(this SpecificationFilter specification) =>
         specification.HasLatencyBudgetNanoseconds ? specification.LatencyBudgetNanoseconds : null;
 
+    /// <summary>The request's remaining transport budget, or null when it declares none (never 0 for absent).</summary>
+    internal static ulong? RemainingTransportBudgetNanosecondsOrNull(this DecideRequest request) =>
+        request.HasRemainingTransportBudgetNanoseconds ? request.RemainingTransportBudgetNanoseconds : null;
+
     /// <summary>The Event's acknowledged filter epoch, or null when it declares none.</summary>
     internal static ulong? AcknowledgedFilterEpochOrNull(this ProducerEvent @event) =>
         @event.HasAcknowledgedFilterEpoch ? @event.AcknowledgedFilterEpoch : null;

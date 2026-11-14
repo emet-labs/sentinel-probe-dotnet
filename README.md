@@ -12,7 +12,8 @@ The SDK:
   sampling (`Filter/`, ADR-0006)
 - exports ended spans and producer completeness as OTLP/HTTP protobuf, and
   receives Verdict, EventFilter, and DecideResponse (`Otlp/`, loopback by default and bindable;
-  the #398 Probe-wire exception). The gate waits on that log. Connect is not
+  the #398 Probe-wire exception). The gate waits on that log for at most the
+  request's remaining Transport Budget, then applies its fail mode. Connect is not
   the live path.
 - reads source-tier from deployment config (`Config/`, ADR-0022, never hard-coded)
 
@@ -23,6 +24,12 @@ The SDK:
 A missing predecessor id fails that export. `OtlpLogReceiver` serves `POST /v1/logs`; it binds
 `127.0.0.1` on a random port by default, and `OtlpLogReceiver.Start("0.0.0.0", 9300)` (or
 `Start(IPAddress, port)`) lets a containerised Probe receive Event Filters.
+`Start(TimeProvider)` and `Start(IPAddress, port, TimeProvider)` take the clock that times each
+decision wait, so a test can expire one without a wall clock. A wait lasts at most the request's
+remaining Transport Budget, floored to whole 100 ns ticks and capped at the `Timer` limit
+(`uint.MaxValue - 1` ms, about 49.7 days). Below 100 ns no timer is armed and the wait fails at
+once. On `TimeProvider.System` the timer counts whole milliseconds, so a budget below 1 ms arms a
+0 ms timer that fires at once, close to TypeScript and Elixir, which fail without arming (#536).
 `new OtlpExporter(url, http, resourceAttributes)` sends OTLP **resource** attributes (`service.name`
 and the provenance keys of `platform/probe-config`) with every trace export. They are never span
 attributes, so the eight-key span contract is unchanged. A non-2xx answer throws an

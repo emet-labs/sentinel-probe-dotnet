@@ -50,10 +50,14 @@ internal sealed class ManualTimeProvider : TimeProvider
         }
     }
 
+    /// <summary>Runs after each timer is created and recorded, before CreateTimer returns it.</summary>
+    public Action<ManualTimer>? OnCreateTimer { get; set; }
+
     public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
     {
         var timer = new ManualTimer(callback, state, dueTime, period);
         lock (_lock) _timers.Add(timer);
+        OnCreateTimer?.Invoke(timer);
         return timer;
     }
 }

@@ -98,7 +98,7 @@ public class OtlpWireTests
         Assert.Single(receiver.Filters);
 
         Assert.Equal(200, receiver.Ingest(Golden("decide-response.bin")));
-        var decision = await receiver.WaitForDecisionAsync("req-charge-1", CancellationToken.None);
+        var decision = await receiver.WaitForDecisionAsync("req-charge-1", null, CancellationToken.None);
         Assert.Equal("req-charge-1", decision.RequestId);
         Assert.Equal(DecisionAction.Deny, decision.Action);
         Assert.Equal(DecisionAction.Permit, Assert.Single(decision.Specifications).Action);

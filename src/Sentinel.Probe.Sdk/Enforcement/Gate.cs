@@ -104,8 +104,9 @@ public static class Gate
 {
     /// <summary>
     /// Adapts the OTLP log receiver to this gate. The returned delegate waits for a
-    /// <c>DecideResponse</c> log with the request id. It does not call Connect.
-    /// Cancellation and a receiver error still fall through to the fail mode below.
+    /// <c>DecideResponse</c> log with the request id for at most the request's remaining
+    /// Transport Budget. It does not call Connect. An expired wait, cancellation and a receiver
+    /// error all fall through to the fail mode below.
     /// </summary>
     public static DecideFunc FromLogReceiver(OtlpLogReceiver receiver)
     {
@@ -121,7 +122,7 @@ public static class Gate
             }
             try
             {
-                var response = await receiver.WaitForDecisionAsync(request.RequestId, cancellationToken).ConfigureAwait(false);
+                var response = await receiver.WaitForDecisionAsync(request.RequestId, request.RemainingTransportBudgetNanosecondsOrNull(), cancellationToken).ConfigureAwait(false);
                 return new DecideOutcome(response, null);
             }
             catch (OperationCanceledException)

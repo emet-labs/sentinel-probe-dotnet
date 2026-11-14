@@ -30,8 +30,10 @@ public sealed class OtlpLogReceiver : IDisposable
     private readonly List<Verdict> _verdicts = new();
     private readonly List<EventFilter> _filters = new();
     private readonly Dictionary<string, DecideResponse> _decisions = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, TaskCompletionSource<DecideResponse>> _waiters = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DecisionWaiter> _waiters = new(StringComparer.Ordinal);
+    private readonly TimeProvider _timeProvider;
     private volatile bool _stop;
+    private bool _closed; // guarded by _gate
 
     /// <summary>
     /// A URL that reaches this receiver from the same host: the bound address, or loopback when the
@@ -56,17 +58,25 @@ public sealed class OtlpLogReceiver : IDisposable
 
     public int Port => _port;
 
-    private OtlpLogReceiver(TcpListener listener, IPAddress address, int port)
+    private OtlpLogReceiver(TcpListener listener, IPAddress address, int port, TimeProvider timeProvider)
     {
         _listener = listener;
         BoundAddress = address;
         _port = port;
+        _timeProvider = timeProvider;
         _thread = new Thread(Serve) { IsBackground = true, Name = "sentinel-otlp-logs" };
         _thread.Start();
     }
 
-    /// <summary>Starts a receiver on loopback and a random port.</summary>
-    public static OtlpLogReceiver Start() => Start(IPAddress.Loopback, 0);
+    /// <summary>Starts a receiver on loopback and a random port, timing decision waits on the system clock.</summary>
+    public static OtlpLogReceiver Start() => Start(IPAddress.Loopback, 0, TimeProvider.System);
+
+    /// <summary>
+    /// Starts a receiver on loopback and a random port whose decision waits are timed by
+    /// <paramref name="timeProvider"/>. A test passes a manual provider to expire a wait without a
+    /// wall clock.
+    /// </summary>
+    public static OtlpLogReceiver Start(TimeProvider timeProvider) => Start(IPAddress.Loopback, 0, timeProvider);
 
     /// <summary>
     /// Starts a receiver on <paramref name="host"/> (an IP literal such as <c>0.0.0.0</c> or
@@ -91,9 +101,17 @@ public sealed class OtlpLogReceiver : IDisposable
     }
 
     /// <summary>Starts a receiver bound to <paramref name="address"/> and <paramref name="port"/>.</summary>
-    public static OtlpLogReceiver Start(IPAddress address, int port)
+    public static OtlpLogReceiver Start(IPAddress address, int port) => Start(address, port, TimeProvider.System);
+
+    /// <summary>
+    /// Starts a receiver bound to <paramref name="address"/> and <paramref name="port"/> (0 picks a
+    /// free port) whose decision waits are timed by <paramref name="timeProvider"/>. Every other
+    /// <c>Start</c> overload calls this one.
+    /// </summary>
+    public static OtlpLogReceiver Start(IPAddress address, int port, TimeProvider timeProvider)
     {
         ArgumentNullException.ThrowIfNull(address);
+        ArgumentNullException.ThrowIfNull(timeProvider);
         if (port < 0 || port > 65535)
         {
             throw new ArgumentOutOfRangeException(nameof(port), "Port must be 0..65535.");
@@ -101,7 +119,7 @@ public sealed class OtlpLogReceiver : IDisposable
         var listener = new TcpListener(address, port);
         listener.Start();
         var bound = ((IPEndPoint)listener.LocalEndpoint).Port;
-        return new OtlpLogReceiver(listener, address, bound);
+        return new OtlpLogReceiver(listener, address, bound, timeProvider);
     }
 
     /// <summary>
@@ -131,42 +149,106 @@ public sealed class OtlpLogReceiver : IDisposable
         }
     }
 
-    public Task<DecideResponse> WaitForDecisionAsync(string requestId, CancellationToken cancellationToken)
+    /// <summary>
+    /// Waits for the DecideResponse whose request id is <paramref name="requestId"/>, for at most
+    /// <paramref name="budgetNs"/>, the request's remaining Transport Budget.
+    /// <list type="bullet">
+    /// <item>An answer that already arrived is returned at once and consumed, whatever the budget.</item>
+    /// <item>Otherwise a null budget, or one that floors to zero 100 ns ticks, cannot be waited: the
+    /// task fails at once and no timer is armed. Missing evidence is never a pass.</item>
+    /// <item>Otherwise the waiter is registered first and a timer is armed for the budget, floored to
+    /// whole 100 ns ticks so the wait never outlives the budget. On expiry the task fails with a
+    /// <see cref="TimeoutException"/>. A budget beyond <c>uint.MaxValue - 1</c> milliseconds (about
+    /// 49.7 days, the <see cref="Timer"/> limit) is shortened to that limit.</item>
+    /// </list>
+    /// The timer and the cancellation registration are released on every exit: answer, expiry,
+    /// cancellation and <see cref="Dispose"/>. An answer that arrives after its wait expired is
+    /// kept, and a later wait for the same request id returns it. A closed receiver fails a new
+    /// wait at once. One waiter per request id: a second concurrent wait throws (#535).
+    /// </summary>
+    public Task<DecideResponse> WaitForDecisionAsync(string requestId, ulong? budgetNs, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(requestId))
         {
             throw new OtlpExportException("DecideResponse request_id is empty");
         }
         cancellationToken.ThrowIfCancellationRequested();
-        var source = new TaskCompletionSource<DecideResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var waiter = new DecisionWaiter();
+        TimeSpan due;
         lock (_gate)
         {
             if (_decisions.Remove(requestId, out var ready))
             {
-                source.SetResult(ready);
-                return source.Task;
+                return Task.FromResult(ready);
+            }
+            if (_closed)
+            {
+                return Task.FromException<DecideResponse>(new OtlpExportException("log receiver stopped"));
+            }
+            due = budgetNs.HasValue ? Due(budgetNs.GetValueOrDefault()) : TimeSpan.Zero;
+            if (due == TimeSpan.Zero)
+            {
+                return Task.FromException<DecideResponse>(new OtlpExportException(
+                    "no DecideResponse for " + requestId + " and no Transport Budget left to wait for one"));
             }
             if (_waiters.ContainsKey(requestId))
             {
                 throw new OtlpExportException("a decision wait is already registered for " + requestId);
             }
-            _waiters.Add(requestId, source);
+            // Registered before the timer is armed, so an answer or an expiry that lands while
+            // arming finds the waiter.
+            _waiters.Add(requestId, waiter);
         }
+        ITimer timer;
+        try
+        {
+            timer = _timeProvider.CreateTimer(
+                _ => Release(requestId, waiter, w => w.Fail(new TimeoutException("timeout"))),
+                null,
+                due,
+                Timeout.InfiniteTimeSpan);
+        }
+        catch (Exception error)
+        {
+            // A wait that cannot be armed must not stay registered: it would never expire, and
+            // it would refuse every later wait for this request id.
+            Release(requestId, waiter, w => w.Fail(error));
+            return waiter.Task;
+        }
+        waiter.Attach(timer);
         if (cancellationToken.CanBeCanceled)
         {
-            cancellationToken.Register(() =>
-            {
-                lock (_gate)
-                {
-                    if (_waiters.TryGetValue(requestId, out var current) && ReferenceEquals(current, source))
-                    {
-                        _waiters.Remove(requestId);
-                    }
-                }
-                source.TrySetCanceled(cancellationToken);
-            });
+            waiter.Attach(cancellationToken.Register(
+                () => Release(requestId, waiter, w => w.Cancel(cancellationToken))));
         }
-        return source.Task;
+        return waiter.Task;
+    }
+
+    /// <summary>
+    /// The timer due time for a remaining budget: floored to whole 100 ns ticks, so the wait never
+    /// outlives the budget, and capped at <c>uint.MaxValue - 1</c> milliseconds, the most a
+    /// <see cref="Timer"/> accepts.
+    /// </summary>
+    internal static TimeSpan Due(ulong budgetNs)
+    {
+        const ulong maxTicks = (uint.MaxValue - 1UL) * TimeSpan.TicksPerMillisecond;
+        ulong ticks = budgetNs / (1_000_000_000UL / TimeSpan.TicksPerSecond);
+        return TimeSpan.FromTicks((long)Math.Min(ticks, maxTicks));
+    }
+
+    // Removes the waiter when it is still the one registered for the request id, then completes it.
+    // A waiter already released by an answer, an expiry, a cancellation or Dispose is left alone.
+    private void Release(string requestId, DecisionWaiter waiter, Action<DecisionWaiter> complete)
+    {
+        lock (_gate)
+        {
+            if (!_waiters.TryGetValue(requestId, out var current) || !ReferenceEquals(current, waiter))
+            {
+                return;
+            }
+            _waiters.Remove(requestId);
+        }
+        complete(waiter);
     }
 
     /// <summary>Decodes one uncompressed export. Returns the HTTP status the socket would send.</summary>
@@ -191,6 +273,10 @@ public sealed class OtlpLogReceiver : IDisposable
         }
     }
 
+    /// <summary>
+    /// Stops the receiver. Every pending decision wait fails, its timer is released, and a later
+    /// wait fails at once unless its answer already arrived.
+    /// </summary>
     public void Dispose()
     {
         _stop = true;
@@ -202,13 +288,16 @@ public sealed class OtlpLogReceiver : IDisposable
         {
             // The accept loop is already gone.
         }
+        List<DecisionWaiter> pending;
         lock (_gate)
         {
-            foreach (var waiter in _waiters.Values)
-            {
-                waiter.TrySetException(new OtlpExportException("log receiver stopped"));
-            }
+            _closed = true;
+            pending = new List<DecisionWaiter>(_waiters.Values);
             _waiters.Clear();
+        }
+        foreach (var waiter in pending)
+        {
+            waiter.Fail(new OtlpExportException("log receiver stopped"));
         }
     }
 
@@ -244,6 +333,7 @@ public sealed class OtlpLogReceiver : IDisposable
                     throw new OtlpExportException("unsupported sentinel.payload.type " + payload);
             }
         }
+        var answered = new List<(DecisionWaiter Waiter, DecideResponse Decision)>();
         lock (_gate)
         {
             foreach (var decision in decisions)
@@ -259,13 +349,93 @@ public sealed class OtlpLogReceiver : IDisposable
             {
                 if (_waiters.Remove(decision.RequestId, out var waiter))
                 {
-                    waiter.TrySetResult(decision);
+                    answered.Add((waiter, decision));
                 }
                 else
                 {
                     _decisions.Add(decision.RequestId, decision);
                 }
             }
+        }
+        foreach (var (waiter, decision) in answered)
+        {
+            waiter.Answer(decision);
+        }
+    }
+
+    // One pending decision wait: its task, the expiry timer and the cancellation registration.
+    // Every completion releases both before completing the task. A timer or registration attached
+    // after the wait already completed (an answer delivered while arming) is released at once.
+    private sealed class DecisionWaiter
+    {
+        private readonly object _lock = new();
+        private readonly TaskCompletionSource<DecideResponse> _source = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private ITimer? _timer;
+        private CancellationTokenRegistration _registration;
+        private bool _released;
+
+        public Task<DecideResponse> Task => _source.Task;
+
+        public void Attach(ITimer timer)
+        {
+            lock (_lock)
+            {
+                if (!_released)
+                {
+                    _timer = timer;
+                    return;
+                }
+            }
+            timer.Dispose();
+        }
+
+        public void Attach(CancellationTokenRegistration registration)
+        {
+            lock (_lock)
+            {
+                if (!_released)
+                {
+                    _registration = registration;
+                    return;
+                }
+            }
+            registration.Unregister();
+        }
+
+        public void Answer(DecideResponse decision)
+        {
+            ReleaseResources();
+            _source.TrySetResult(decision);
+        }
+
+        public void Fail(Exception error)
+        {
+            ReleaseResources();
+            _source.TrySetException(error);
+        }
+
+        public void Cancel(CancellationToken cancellationToken)
+        {
+            ReleaseResources();
+            _source.TrySetCanceled(cancellationToken);
+        }
+
+        private void ReleaseResources()
+        {
+            ITimer? timer;
+            CancellationTokenRegistration registration;
+            lock (_lock)
+            {
+                _released = true;
+                timer = _timer;
+                registration = _registration;
+                _timer = null;
+                _registration = default;
+            }
+            timer?.Dispose();
+            // Unregister, not Dispose: Dispose blocks until a running cancellation callback ends,
+            // and that callback may be the caller.
+            registration.Unregister();
         }
     }
 
