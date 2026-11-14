@@ -39,6 +39,8 @@ public class OtlpRoundTripTests
             parent: null,
             new KeyValuePair<string, object?>("sagashop.payment.status", "success"),
             new KeyValuePair<string, object?>("sagashop.order.id", "order-1001"));
+        // An OTLP ack means stored; periphery evaluates and pushes after it (#454).
+        await session.EvaluationsSettledAsync();
         Assert.Empty(session.Receiver.Verdicts);
         await session.ExportAsync(
             "sagashop-order",
@@ -187,8 +189,37 @@ public class OtlpRoundTripTests
 
         public async Task<IReadOnlyList<Verdict>> WaitForVerdictsAsync()
         {
+            await EvaluationsSettledAsync();
             await WaitUntilAsync(() => Receiver.Verdicts.Count > 0, "no Verdict log arrived");
             return Receiver.Verdicts;
+        }
+
+        /// <summary>
+        /// Returns once periphery has finished every evaluation requested before the call
+        /// (#454): an OTLP ack means the evidence is stored, and evaluation and the Verdict
+        /// push run on periphery's evaluation worker after the response. Reads
+        /// <c>requested</c> once from <c>GET /v1/evaluations/queue</c> and polls until
+        /// <c>completed</c> reaches it. A failed pass still completes its requests, so this
+        /// also checks that none failed.
+        /// </summary>
+        public async Task EvaluationsSettledAsync()
+        {
+            using var http = new HttpClient();
+            long? target = null;
+            for (var i = 0; i < 400; i++)
+            {
+                var text = await http.GetStringAsync(_baseUrl + "/v1/evaluations/queue");
+                using var counters = System.Text.Json.JsonDocument.Parse(text);
+                var root = counters.RootElement;
+                target ??= root.GetProperty("requested").GetInt64();
+                if (root.GetProperty("completed").GetInt64() >= target)
+                {
+                    Assert.Equal(0L, root.GetProperty("failed_passes").GetInt64());
+                    return;
+                }
+                await Task.Delay(10);
+            }
+            throw new TimeoutException("periphery's evaluations did not settle\n" + Log());
         }
 
         public async ValueTask DisposeAsync()
