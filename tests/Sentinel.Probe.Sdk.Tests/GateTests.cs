@@ -26,7 +26,7 @@ public class GateTests
     [Fact]
     public async Task Permit()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionPermit) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Permit) };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
             I64(10000), TestSupport.MakeDeps(mock, 0), TestSupport.TestOptions, CancellationToken.None);
@@ -39,7 +39,7 @@ public class GateTests
     [Fact]
     public async Task Deny()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionDeny) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Deny) };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
             I64(10000), TestSupport.MakeDeps(mock, 0), TestSupport.TestOptions, CancellationToken.None);
@@ -49,7 +49,7 @@ public class GateTests
     [Fact]
     public async Task DeferWithBudgetRemaining()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionDefer) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Defer) };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
             I64(10000), TestSupport.MakeDeps(mock, 0), TestSupport.TestOptions, CancellationToken.None);
@@ -59,7 +59,7 @@ public class GateTests
     [Fact]
     public async Task DeferBudgetExhaustedFailsOpen()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionDefer) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Defer) };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
             I64(10000), TestSupport.MakeDeps(mock, 20000), TestSupport.TestOptions, CancellationToken.None);
@@ -69,7 +69,7 @@ public class GateTests
     [Fact]
     public async Task DeferBudgetExhaustedFailsClosedWhenContracted()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionDefer) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Defer) };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.ClosedAskAndBlockSpec()),
             I64(10000), TestSupport.MakeDeps(mock, 20000, TestSupport.AlwaysClosed), TestSupport.TestOptions, CancellationToken.None);
@@ -111,7 +111,7 @@ public class GateTests
     [Fact]
     public async Task NilAcceptedFailModeForThrows()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionPermit) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Permit) };
         var deps = new Deps
         {
             Decide = mock.DecideAsync,
@@ -162,17 +162,17 @@ public class GateTests
     public async Task UnspecifiedFailModeIsOpen()
     {
         var mock = new MockDecider { Error = new Exception("boom") };
-        var spec = TestSupport.MakeSpec("s", new() { TestSupport.TestKind }, FailMode.FailModeUnspecified, DeliveryMode.DeliveryModeAskAndBlock);
+        var spec = TestSupport.MakeSpec("s", new() { TestSupport.TestKind }, FailMode.Unspecified, DeliveryMode.AskAndBlock);
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), spec),
-            I64(10000), TestSupport.MakeDeps(mock, 0, _ => FailMode.FailModeOpen), TestSupport.TestOptions, CancellationToken.None);
+            I64(10000), TestSupport.MakeDeps(mock, 0, _ => FailMode.Open), TestSupport.TestOptions, CancellationToken.None);
         Assert.Equal(OutcomeKind.FailOpenPermit, outcome.Kind);
     }
 
     [Fact]
     public async Task ShipAsyncSpecsArePermittedWithoutAsking()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionPermit) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Permit) };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.ShipAsyncSpec()),
             I64(10000), TestSupport.MakeDeps(mock, 0), TestSupport.TestOptions, CancellationToken.None);
@@ -183,8 +183,8 @@ public class GateTests
     [Fact]
     public async Task NonSelectingSpecIsNotEnforcing()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionPermit) };
-        var spec = TestSupport.MakeSpec("s", new() { "other.kind" }, FailMode.FailModeClosed, DeliveryMode.DeliveryModeAskAndBlock);
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Permit) };
+        var spec = TestSupport.MakeSpec("s", new() { "other.kind" }, FailMode.Closed, DeliveryMode.AskAndBlock);
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), spec),
             I64(10000), TestSupport.MakeDeps(mock, 0, TestSupport.AlwaysClosed), TestSupport.TestOptions, CancellationToken.None);
@@ -195,7 +195,7 @@ public class GateTests
     [Fact]
     public async Task BudgetExhaustedSkipsDecide()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionPermit) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Permit) };
         await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
             I64(10000), TestSupport.MakeDeps(mock, 20000), TestSupport.TestOptions, CancellationToken.None);
@@ -205,7 +205,7 @@ public class GateTests
     [Fact]
     public async Task UnspecifiedActionIsNotABlindPermit()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionUnspecified) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Unspecified) };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
             I64(10000), TestSupport.MakeDeps(mock, 0), TestSupport.TestOptions, CancellationToken.None);
@@ -215,7 +215,7 @@ public class GateTests
     [Fact]
     public async Task UnspecifiedActionFailsClosedWhenContracted()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionUnspecified) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Unspecified) };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.ClosedAskAndBlockSpec()),
             I64(10000), TestSupport.MakeDeps(mock, 0, TestSupport.AlwaysClosed), TestSupport.TestOptions, CancellationToken.None);
@@ -225,29 +225,31 @@ public class GateTests
     [Fact]
     public async Task BudgetComesFromTheInjectedClock()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionPermit) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Permit) };
         await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
             I64(10000), TestSupport.MakeDeps(mock, 3000), TestSupport.TestOptions, CancellationToken.None);
         var req = mock.LastRequest!;
+        Assert.True(req.HasRemainingTransportBudgetNanoseconds);
         Assert.Equal(7000UL, req.RemainingTransportBudgetNanoseconds);
     }
 
     [Fact]
     public async Task WithoutCallerBudgetUsesSpecificationBudget()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionPermit) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Permit) };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
             null, TestSupport.MakeDeps(mock, 0), TestSupport.TestOptions, CancellationToken.None);
         Assert.Equal(OutcomeKind.Permit, outcome.Kind);
+        Assert.True(mock.LastRequest!.HasRemainingTransportBudgetNanoseconds);
         Assert.Equal(10_000UL, mock.LastRequest!.RemainingTransportBudgetNanoseconds);
     }
 
     [Fact]
     public async Task WithoutCallerBudgetDefersWhileSpecificationBudgetRemains()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionDefer) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Defer) };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
             null, TestSupport.MakeDeps(mock, 0), TestSupport.TestOptions, CancellationToken.None);
@@ -287,7 +289,7 @@ public class GateTests
     [Fact]
     public async Task EpochZeroIsAFilter()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionPermit) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Permit) };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(0), TestSupport.AskAndBlockSpec()),
             I64(10000), TestSupport.MakeDeps(mock, 0), TestSupport.TestOptions, CancellationToken.None);
@@ -298,7 +300,7 @@ public class GateTests
     [Fact]
     public async Task RequestCarriesIdentifiersAndEvent()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionPermit) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Permit) };
         var @event = TestSupport.MakeEvent(TestSupport.TestKind);
         var options = new Options { SourceHandle = "gateway.tool-calls", RequestId = "req-1", IdempotencyKey = "idem-key-42" };
         await Gate.GateAsync(@event, TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
@@ -308,6 +310,7 @@ public class GateTests
         Assert.Equal("req-1", req.RequestId);
         Assert.Equal("gateway.tool-calls", req.SourceHandle);
         Assert.Same(@event, req.ProducerEvent);
+        Assert.True(req.HasFilterEpoch);
         Assert.Equal(TestSupport.TestEpoch, req.FilterEpoch);
     }
 
@@ -317,10 +320,10 @@ public class GateTests
         const ulong epoch = 42;
         var cases = new (string name, MockDecider mock)[]
         {
-            ("permit", new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionPermit) }),
-            ("deny", new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionDeny) }),
-            ("defer", new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionDefer) }),
-            ("unspecified", new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionUnspecified) }),
+            ("permit", new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Permit) }),
+            ("deny", new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Deny) }),
+            ("defer", new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Defer) }),
+            ("unspecified", new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Unspecified) }),
             ("transport error", new MockDecider { Error = new Exception("boom") }),
         };
         foreach (var (name, mock) in cases)
@@ -337,11 +340,11 @@ public class GateTests
     [Fact]
     public async Task SurfacesSpecificationDecisions()
     {
-        var reason = UnresolvedReason.UnresolvedReasonEvidenceGap;
+        var reason = UnresolvedReason.EvidenceGap;
         var mock = new MockDecider
         {
-            Response = TestSupport.MakeResponse(DecisionAction.DecisionActionDefer,
-                TestSupport.MakeDecision("spec-1", DecisionAction.DecisionActionDefer, reason)),
+            Response = TestSupport.MakeResponse(DecisionAction.Defer,
+                TestSupport.MakeDecision("spec-1", DecisionAction.Defer, reason)),
         };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
@@ -349,31 +352,32 @@ public class GateTests
         Assert.Equal(OutcomeKind.Defer, outcome.Kind);
         var decision = Assert.Single(outcome.Specifications);
         Assert.Equal("spec-1", decision.SpecificationId);
-        Assert.Equal(UnresolvedReason.UnresolvedReasonEvidenceGap, decision.UnresolvedReason);
+        Assert.True(decision.HasUnresolvedReason);
+        Assert.Equal(UnresolvedReason.EvidenceGap, decision.UnresolvedReason);
     }
 
     [Fact]
     public async Task SurfacesSpecificationDecisionsOnFailMode()
     {
-        var reason = UnresolvedReason.UnresolvedReasonTimeout;
+        var reason = UnresolvedReason.Timeout;
         var mock = new MockDecider
         {
-            Response = TestSupport.MakeResponse(DecisionAction.DecisionActionUnspecified,
-                TestSupport.MakeDecision("spec-1", DecisionAction.DecisionActionUnspecified, reason)),
+            Response = TestSupport.MakeResponse(DecisionAction.Unspecified,
+                TestSupport.MakeDecision("spec-1", DecisionAction.Unspecified, reason)),
         };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
             I64(10000), TestSupport.MakeDeps(mock, 0), TestSupport.TestOptions, CancellationToken.None);
         Assert.Equal(OutcomeKind.FailOpenPermit, outcome.Kind);
         var decision = Assert.Single(outcome.Specifications);
-        Assert.NotNull(decision.UnresolvedReason);
+        Assert.True(decision.HasUnresolvedReason);
     }
 
     // A dead cancellation token is a transport error: never a permit, never a throw, no ask issued.
     [Fact]
     public async Task AlreadyCancelledContextTakesTheFailModePath()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionPermit) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Permit) };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), TestSupport.AskAndBlockSpec()),
             null, TestSupport.MakeDeps(mock, 0), TestSupport.TestOptions, CanceledToken);
@@ -438,31 +442,32 @@ public class GateTests
     [Fact]
     public async Task EffectiveBudgetIsMinimumAcrossEligibleSpecifications()
     {
-        var specA = TestSupport.MakeSpec("spec-a", new() { TestSupport.TestKind }, FailMode.FailModeOpen, DeliveryMode.DeliveryModeAskAndBlock);
+        var specA = TestSupport.MakeSpec("spec-a", new() { TestSupport.TestKind }, FailMode.Open, DeliveryMode.AskAndBlock);
         specA.LatencyBudgetNanoseconds = 50_000;
-        var specB = TestSupport.MakeSpec("spec-b", new() { TestSupport.TestKind }, FailMode.FailModeOpen, DeliveryMode.DeliveryModeAskAndBlock);
+        var specB = TestSupport.MakeSpec("spec-b", new() { TestSupport.TestKind }, FailMode.Open, DeliveryMode.AskAndBlock);
         specB.LatencyBudgetNanoseconds = 8_000;
-        var specC = TestSupport.MakeSpec("spec-c", new() { TestSupport.TestKind }, FailMode.FailModeOpen, DeliveryMode.DeliveryModeAskAndBlock);
+        var specC = TestSupport.MakeSpec("spec-c", new() { TestSupport.TestKind }, FailMode.Open, DeliveryMode.AskAndBlock);
         specC.LatencyBudgetNanoseconds = 20_000;
 
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionPermit) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Permit) };
         var outcome = await Gate.GateAsync(TestSupport.MakeEvent(TestSupport.TestKind),
             TestSupport.MakeFilter(U64(TestSupport.TestEpoch), specA, specB, specC),
             null, TestSupport.MakeDeps(mock, 0), TestSupport.TestOptions, CancellationToken.None);
 
         Assert.Equal(OutcomeKind.Permit, outcome.Kind);
+        Assert.True(mock.LastRequest!.HasRemainingTransportBudgetNanoseconds);
         Assert.Equal(8_000UL, mock.LastRequest!.RemainingTransportBudgetNanoseconds);
     }
 
     [Fact]
     public async Task DeferGatedByMinimumSpecificationBudgetNotTheLargest()
     {
-        var specA = TestSupport.MakeSpec("spec-a", new() { TestSupport.TestKind }, FailMode.FailModeOpen, DeliveryMode.DeliveryModeAskAndBlock);
+        var specA = TestSupport.MakeSpec("spec-a", new() { TestSupport.TestKind }, FailMode.Open, DeliveryMode.AskAndBlock);
         specA.LatencyBudgetNanoseconds = 20_000;
-        var specB = TestSupport.MakeSpec("spec-b", new() { TestSupport.TestKind }, FailMode.FailModeOpen, DeliveryMode.DeliveryModeAskAndBlock);
+        var specB = TestSupport.MakeSpec("spec-b", new() { TestSupport.TestKind }, FailMode.Open, DeliveryMode.AskAndBlock);
         specB.LatencyBudgetNanoseconds = 5_000;
 
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionDefer) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Defer) };
         int calls = 0;
         var deps = TestSupport.MakeDeps(mock, 0);
         deps = new Deps
@@ -489,7 +494,7 @@ public class GateTests
     [Fact]
     public async Task WithoutCallerDeadlineDeferTimesOutOnceSpecificationBudgetIsExhausted()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionDefer) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Defer) };
         int calls = 0;
         var baseDeps = TestSupport.MakeDeps(mock, 0);
         var deps = new Deps
@@ -516,7 +521,7 @@ public class GateTests
     public async Task MissingEligibleBudgetExhaustsWithoutClockOrDecide()
     {
         var spec = TestSupport.AskAndBlockSpec();
-        spec.LatencyBudgetNanoseconds = null;
+        spec.ClearLatencyBudgetNanoseconds();
         var mock = new MockDecider();
         int clockCalls = 0;
         var deps = new Deps
@@ -546,7 +551,7 @@ public class GateTests
     [Fact]
     public async Task ThrowingClockPropagates()
     {
-        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.DecisionActionDefer) };
+        var mock = new MockDecider { Response = TestSupport.MakeResponse(DecisionAction.Defer) };
         int clockCalls = 0;
         var deps = new Deps
         {

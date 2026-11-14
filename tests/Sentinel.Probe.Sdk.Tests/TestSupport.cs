@@ -31,24 +31,32 @@ internal static class TestSupport
         {
             SpecificationId = specificationId,
             SpecificationVersion = "1.0.0",
-            EventMatch = new EventMatch { EventKinds = kinds ?? new(), DeliveryMode = deliveryMode },
+            EventMatch = new EventMatch { EventKinds = { kinds ?? new List<string>() }, DeliveryMode = deliveryMode },
             FailMode = failMode,
-            EvaluationMode = EvaluationMode.EvaluationModeEnforce,
-            Readiness = Readiness.ReadinessActive,
+            EvaluationMode = EvaluationMode.Enforce,
+            Readiness = Readiness.Active,
             LatencyBudgetNanoseconds = 10_000,
         };
 
     public static SpecificationFilter AskAndBlockSpec() =>
-        MakeSpec("spec-1", new() { TestKind }, FailMode.FailModeOpen, DeliveryMode.DeliveryModeAskAndBlock);
+        MakeSpec("spec-1", new() { TestKind }, FailMode.Open, DeliveryMode.AskAndBlock);
 
     public static SpecificationFilter ClosedAskAndBlockSpec() =>
-        MakeSpec("spec-1", new() { TestKind }, FailMode.FailModeClosed, DeliveryMode.DeliveryModeAskAndBlock);
+        MakeSpec("spec-1", new() { TestKind }, FailMode.Closed, DeliveryMode.AskAndBlock);
 
     public static SpecificationFilter ShipAsyncSpec() =>
-        MakeSpec("spec-1", new() { TestKind }, FailMode.FailModeOpen, DeliveryMode.DeliveryModeShipAsync);
+        MakeSpec("spec-1", new() { TestKind }, FailMode.Open, DeliveryMode.ShipAsync);
 
-    public static EventFilter MakeFilter(ulong? epoch, params SpecificationFilter[] specs) =>
-        new() { Epoch = epoch, Specifications = new List<SpecificationFilter>(specs) };
+    public static EventFilter MakeFilter(ulong? epoch, params SpecificationFilter[] specs)
+    {
+        var filter = new EventFilter { Specifications = { specs } };
+        // proto3 `optional`: null leaves the epoch absent (HasEpoch false), never 0.
+        if (epoch.HasValue)
+        {
+            filter.Epoch = epoch.Value;
+        }
+        return filter;
+    }
 
     public static Deps MakeDeps(MockDecider mock, long nowNs, Func<SpecificationFilter, FailMode>? accepted = null) =>
         new()
@@ -58,20 +66,26 @@ internal static class TestSupport
             AcceptedFailModeFor = accepted ?? AlwaysOpen,
         };
 
-    public static FailMode AlwaysClosed(SpecificationFilter _) => FailMode.FailModeClosed;
-    public static FailMode AlwaysOpen(SpecificationFilter _) => FailMode.FailModeOpen;
+    public static FailMode AlwaysClosed(SpecificationFilter _) => FailMode.Closed;
+    public static FailMode AlwaysOpen(SpecificationFilter _) => FailMode.Open;
 
     public static DecideResponse MakeResponse(DecisionAction action, params SpecificationDecision[] decisions) =>
-        new() { RequestId = "mock", Action = action, Specifications = new List<SpecificationDecision>(decisions) };
+        new() { RequestId = "mock", Action = action, Specifications = { decisions } };
 
-    public static SpecificationDecision MakeDecision(string specificationId, DecisionAction action, UnresolvedReason? unresolved = null) =>
-        new()
+    public static SpecificationDecision MakeDecision(string specificationId, DecisionAction action, UnresolvedReason? unresolved = null)
+    {
+        var decision = new SpecificationDecision
         {
             SpecificationId = specificationId,
             SpecificationVersion = "1.0.0",
             Action = action,
-            UnresolvedReason = unresolved,
         };
+        if (unresolved.HasValue)
+        {
+            decision.UnresolvedReason = unresolved.Value;
+        }
+        return decision;
+    }
 }
 
 // MockDecider — the in-process Decide stub, mirroring the Go mockDecider: a canned response, a
@@ -104,7 +118,7 @@ internal sealed class MockDecider
         }
         else
         {
-            resp = new DecideResponse { RequestId = request.RequestId, Action = DecisionAction.DecisionActionPermit };
+            resp = new DecideResponse { RequestId = request.RequestId, Action = DecisionAction.Permit };
         }
         return Task.FromResult(new DecideOutcome(resp, null));
     }

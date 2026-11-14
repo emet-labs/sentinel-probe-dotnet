@@ -8,7 +8,7 @@ namespace Sentinel.Probe.Sdk.Tests;
 public class SpecMatchTests
 {
     private static SpecificationFilter WithKinds(params string[] kinds) =>
-        new() { EventMatch = new EventMatch { EventKinds = new List<string>(kinds) } };
+        new() { EventMatch = new EventMatch { EventKinds = { kinds } } };
 
     public static IEnumerable<object[]> Cases()
     {

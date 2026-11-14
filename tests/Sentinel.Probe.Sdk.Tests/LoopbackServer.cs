@@ -6,6 +6,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using Emet.Sentinel.Probe.V1;
+using Google.Protobuf;
 using Sentinel.Probe.Sdk.Connect;
 
 namespace Sentinel.Probe.Sdk.Tests;
@@ -75,7 +76,7 @@ internal sealed class LoopbackServer : IDisposable
             read += n;
         }
 
-        var request = DecideRequest.ParseFrom(body);
+        var request = DecideRequest.Parser.ParseFrom(body);
         lock (_lock) { _requests.Add(request); }
 
         if (Error is ConnectException ce)

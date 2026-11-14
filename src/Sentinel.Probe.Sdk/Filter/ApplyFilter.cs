@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using Emet.Sentinel.Model.V1;
+using Sentinel.Probe.Sdk.Proto;
 
 namespace Sentinel.Probe.Sdk.Filter;
 
@@ -29,10 +30,11 @@ public static class ApplyFilter
     /// A null filter behaves as a filter with no specifications, i.e. drop.
     /// </summary>
     /// <remarks>
-    /// The returned event always carries a FRESHLY ALLOCATED attribute list, including in the
+    /// The returned event always carries FRESHLY ALLOCATED repeated fields, including in the
     /// keep-everything branch where the reference aliases the input list directly. The
-    /// AttributeEntry elements themselves are still shared with the input, so a caller must not
-    /// mutate an entry in place. A deep copy is deliberately not paid for on the emit hot path.
+    /// AttributeEntry elements, Sequence and OccurrenceTime are still shared with the input, so a
+    /// caller must not mutate them in place. A deep copy is deliberately not paid for on the emit
+    /// hot path.
     /// </remarks>
     public static ProducerEvent? Apply(ProducerEvent? @event, EventFilter? filter)
     {
@@ -96,21 +98,27 @@ public static class ApplyFilter
             }
         }
 
-        // 5. Rebuild with every other field unchanged. Only the attribute list is freshly
-        // allocated; capabilities and predecessors are shared with the input, mirroring the
-        // reference's shallow-aliasing contract.
-        return new ProducerEvent
+        // 5. Rebuild with every other field unchanged. Sequence and OccurrenceTime are shared
+        // with the input, mirroring the reference's shallow-aliasing contract. The generated
+        // repeated fields are get-only, so the attribute, capability and predecessor lists are
+        // fresh RepeatedFields holding the input's elements (enum values and strings, plus the
+        // shared AttributeEntry references). The input message's Clone() is deliberately not used:
+        // it deep-copies every attribute only for step 4 to discard the copy, the cost the Go
+        // reference also declines on the emit hot path.
+        var projectedEvent = new ProducerEvent
         {
             Id = @event.Id,
             Sequence = @event.Sequence,
             SchemaVersion = @event.SchemaVersion,
-            AcknowledgedFilterEpoch = @event.AcknowledgedFilterEpoch,
             Kind = @event.Kind,
             OccurrenceTime = @event.OccurrenceTime,
-            Attributes = trimmed,
-            ClaimedCapabilities = @event.ClaimedCapabilities,
+            Attributes = { trimmed },
+            ClaimedCapabilities = { @event.ClaimedCapabilities },
             ClaimedSensitivity = @event.ClaimedSensitivity,
-            CausalPredecessorIds = @event.CausalPredecessorIds, // never trimmed
+            CausalPredecessorIds = { @event.CausalPredecessorIds }, // never trimmed
         };
+        // proto3 `optional`: an absent acknowledged epoch stays absent; it is not copied as 0.
+        projectedEvent.SetAcknowledgedFilterEpoch(@event.AcknowledgedFilterEpochOrNull());
+        return projectedEvent;
     }
 }

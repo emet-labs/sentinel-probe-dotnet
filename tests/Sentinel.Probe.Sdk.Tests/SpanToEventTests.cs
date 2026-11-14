@@ -50,8 +50,8 @@ public class SpanToEventTests
         foreach (ulong epoch in new[] { 0UL, 42UL })
         {
             var e = Convert(ActivityBuilder.Build(), new SpanConversion { Activity = ActivityBuilder.Build(), AcknowledgedEpoch = epoch });
-            Assert.NotNull(e.AcknowledgedFilterEpoch);
-            Assert.Equal(epoch, e.AcknowledgedFilterEpoch!.Value);
+            Assert.True(e.HasAcknowledgedFilterEpoch);
+            Assert.Equal(epoch, e.AcknowledgedFilterEpoch);
         }
     }
 
@@ -62,13 +62,13 @@ public class SpanToEventTests
         {
             Activity = ActivityBuilder.Build(),
             Sequence = new SequenceCoordinate { Epoch = 2, Sequence = 11 },
-            ClaimedCapabilities = new() { SourceCapability.SourceCapabilityCausalEdges, SourceCapability.SourceCapabilityObserveBeforeEffect },
-            ClaimedSensitivity = Sensitivity.SensitivityRestricted,
+            ClaimedCapabilities = new() { SourceCapability.CausalEdges, SourceCapability.ObserveBeforeEffect },
+            ClaimedSensitivity = Sensitivity.Restricted,
         });
         Assert.Equal(2UL, e.Sequence!.Epoch);
         Assert.Equal(11UL, e.Sequence!.Sequence);
         Assert.Equal(2, e.ClaimedCapabilities.Count);
-        Assert.Equal(Sensitivity.SensitivityRestricted, e.ClaimedSensitivity);
+        Assert.Equal(Sensitivity.Restricted, e.ClaimedSensitivity);
     }
 
     [Fact]
@@ -83,7 +83,7 @@ public class SpanToEventTests
     {
         var e = Convert(ActivityBuilder.Build(tags: new[] { KVP("approved", true) }));
         var v = AttrValue(e, "approved")!;
-        Assert.Equal(AttributeValueOneofCase.BoolValue, v.Case);
+        Assert.Equal(AttributeValue.ValueOneofCase.BoolValue, v.ValueCase);
         Assert.True(v.BoolValue);
     }
 
@@ -92,7 +92,7 @@ public class SpanToEventTests
     {
         var e = Convert(ActivityBuilder.Build(tags: new[] { KVP("sagashop.amount_cents", -4200L) }));
         var v = AttrValue(e, "sagashop.amount_cents")!;
-        Assert.Equal(AttributeValueOneofCase.IntegerValue, v.Case);
+        Assert.Equal(AttributeValue.ValueOneofCase.IntegerValue, v.ValueCase);
         Assert.Equal(-4200L, v.IntegerValue);
     }
 
@@ -102,7 +102,7 @@ public class SpanToEventTests
     {
         var e = Convert(ActivityBuilder.Build(tags: new[] { KVP("ratio", 0.25), KVP("integral", 3.0) }));
         Assert.Equal(0.25, AttrValue(e, "ratio")!.DoubleValue);
-        Assert.Equal(AttributeValueOneofCase.DoubleValue, AttrValue(e, "integral")!.Case);
+        Assert.Equal(AttributeValue.ValueOneofCase.DoubleValue, AttrValue(e, "integral")!.ValueCase);
     }
 
     [Fact]
@@ -110,7 +110,7 @@ public class SpanToEventTests
     {
         var e = Convert(ActivityBuilder.Build(tags: new[] { KVP("payload", new byte[] { 0xde, 0xad, 0xbe, 0xef }) }));
         var v = AttrValue(e, "payload")!;
-        Assert.Equal(AttributeValueOneofCase.BytesValue, v.Case);
+        Assert.Equal(AttributeValue.ValueOneofCase.BytesValue, v.ValueCase);
         Assert.Equal(new byte[] { 0xde, 0xad, 0xbe, 0xef }, v.BytesValue.ToByteArray());
     }
 
@@ -162,7 +162,7 @@ public class SpanToEventTests
         var e = Convert(ActivityBuilder.Build(tags: new[] { KVP("nested", nested) }));
         var entries = AttrValue(e, "nested")!.MapValue!.Entries;
         Assert.Equal(3, entries.Count);
-        static AttributeValue? ByKey(List<AttributeEntry> es, string key)
+        static AttributeValue? ByKey(IEnumerable<AttributeEntry> es, string key)
         {
             foreach (var en in es) if (en.Key == key) return en.Value;
             return null;

@@ -7,6 +7,7 @@ using Emet.Sentinel.Probe.V1;
 using Sentinel.Probe.Sdk.Connect;
 using Sentinel.Probe.Sdk.Filter;
 using Sentinel.Probe.Sdk.Otlp;
+using Sentinel.Probe.Sdk.Proto;
 
 namespace Sentinel.Probe.Sdk.Enforcement;
 
@@ -161,13 +162,13 @@ public static class Gate
         Options options,
         CancellationToken cancellationToken)
     {
-        // 1. No-filter guard. Presence is `Epoch == null`: epoch 0 is a legitimate epoch, so
+        // 1. No-filter guard. Presence is `HasEpoch`: epoch 0 is a legitimate epoch, so
         //    `Epoch == 0` would misclassify it as "no policy held".
-        if (filter == null || filter.Epoch == null)
+        if (filter == null || !filter.HasEpoch)
         {
             return new GateOutcome { Kind = OutcomeKind.NoFilter, Reason = "no-filter" };
         }
-        ulong filterEpoch = filter.Epoch.GetValueOrDefault();
+        ulong filterEpoch = filter.Epoch;
 
         // 2. Enforcing set: selects the event AND asks-and-blocks.
         var enforcing = new List<SpecificationFilter>();
@@ -188,7 +189,9 @@ public static class Gate
         ulong effective = ulong.MaxValue;
         foreach (var spec in enforcing)
         {
-            ulong? specificationBudget = spec.LatencyBudgetNanoseconds;
+            // Presence-aware read: an absent budget and a budget of 0 both fail closed here, but
+            // only because both are exhausted, not because absence is read as 0.
+            ulong? specificationBudget = spec.LatencyBudgetNanosecondsOrNull();
             if (!specificationBudget.HasValue || specificationBudget.Value == 0)
                 return ApplyFailMode(aggregateFailMode, "budget-exhausted", filterEpoch, null);
             effective = Math.Min(effective, specificationBudget.Value);
@@ -202,9 +205,9 @@ public static class Gate
         //    that is already out of time does not spend more of it.
         ulong remaining = Budget.Remaining(anchor, effective, deps.NowMonotonicNs());
         if (remaining == 0) return ApplyFailMode(aggregateFailMode, "budget-exhausted", filterEpoch, null);
-        ulong? remainingBudget = remaining;
 
-        // 5. Build the request from the already-projected event.
+        // 5. Build the request from the already-projected event. Both optional fields are set
+        //    explicitly, so HasFilterEpoch and HasRemainingTransportBudgetNanoseconds are true.
         var request = new DecideRequest
         {
             RequestId = options.RequestId,
@@ -212,7 +215,7 @@ public static class Gate
             SourceHandle = options.SourceHandle,
             FilterEpoch = filterEpoch,
             ProducerEvent = @event,
-            RemainingTransportBudgetNanoseconds = remainingBudget,
+            RemainingTransportBudgetNanoseconds = remaining,
         };
 
         // 6. A dead cancellation token is a transport error: never a permit, never a throw, and no
@@ -259,20 +262,20 @@ public static class Gate
 
         switch (response.Action)
         {
-            case DecisionAction.DecisionActionPermit:
+            case DecisionAction.Permit:
                 return new GateOutcome { Kind = OutcomeKind.Permit, Reason = "permit", FilterEpoch = filterEpoch, Specifications = decisions };
 
-            case DecisionAction.DecisionActionDeny:
+            case DecisionAction.Deny:
                 return new GateOutcome { Kind = OutcomeKind.Deny, Reason = "deny", FilterEpoch = filterEpoch, Specifications = decisions };
 
-            case DecisionAction.DecisionActionDefer:
+            case DecisionAction.Defer:
                 if (Budget.Remaining(anchor, effectiveBudget, deps.NowMonotonicNs()) > 0)
                 {
                     return new GateOutcome { Kind = OutcomeKind.Defer, Reason = "defer", FilterEpoch = filterEpoch, Specifications = decisions };
                 }
                 return ApplyFailMode(aggregateFailMode, "defer-budget-exhausted", filterEpoch, decisions);
 
-            case DecisionAction.DecisionActionUnspecified:
+            case DecisionAction.Unspecified:
                 return ApplyFailMode(aggregateFailMode, "unspecified-action", filterEpoch, decisions);
 
             default:
@@ -283,7 +286,7 @@ public static class Gate
 
     private static GateOutcome ApplyFailMode(FailMode failMode, string reason, ulong filterEpoch, IReadOnlyList<SpecificationDecision>? decisions)
     {
-        OutcomeKind kind = failMode == FailMode.FailModeClosed ? OutcomeKind.FailClosedDeny : OutcomeKind.FailOpenPermit;
+        OutcomeKind kind = failMode == FailMode.Closed ? OutcomeKind.FailClosedDeny : OutcomeKind.FailOpenPermit;
         return new GateOutcome { Kind = kind, Reason = reason, FilterEpoch = filterEpoch, Specifications = decisions ?? Array.Empty<SpecificationDecision>() };
     }
 
@@ -304,19 +307,19 @@ public static class Gate
         }
         foreach (var spec in enforcing)
         {
-            if (spec.FailMode != FailMode.FailModeClosed) continue;
-            if (deps.AcceptedFailModeFor(spec) == FailMode.FailModeClosed)
+            if (spec.FailMode != FailMode.Closed) continue;
+            if (deps.AcceptedFailModeFor(spec) == FailMode.Closed)
             {
-                return FailMode.FailModeClosed;
+                return FailMode.Closed;
             }
         }
-        return FailMode.FailModeOpen;
+        return FailMode.Open;
     }
 
     private static bool IsEnforceable(SpecificationFilter spec) =>
-        spec?.EventMatch?.DeliveryMode == DeliveryMode.DeliveryModeAskAndBlock &&
-        spec.EvaluationMode == EvaluationMode.EvaluationModeEnforce &&
-        spec.Readiness == Readiness.ReadinessActive;
+        spec?.EventMatch?.DeliveryMode == DeliveryMode.AskAndBlock &&
+        spec.EvaluationMode == EvaluationMode.Enforce &&
+        spec.Readiness == Readiness.Active;
 
     /// <summary>
     /// Renders a transport failure for the audit record, distinguishing a cancellation/timeout from

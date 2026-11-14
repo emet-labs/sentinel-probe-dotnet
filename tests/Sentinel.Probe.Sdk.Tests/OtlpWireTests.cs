@@ -36,8 +36,9 @@ public class OtlpWireTests
         Assert.Equal(7UL, charge.Sequence!.Epoch);
         Assert.Equal(1UL, charge.Sequence.Sequence);
         Assert.Equal("sagashop-contract-v1", charge.SchemaVersion);
+        Assert.True(charge.HasAcknowledgedFilterEpoch);
         Assert.Equal(4UL, charge.AcknowledgedFilterEpoch);
-        Assert.Equal(Sensitivity.SensitivityInternal, charge.ClaimedSensitivity);
+        Assert.Equal(Sensitivity.Internal, charge.ClaimedSensitivity);
         Assert.Empty(charge.CausalPredecessorIds);
         Assert.False(spans[0].HasParentSpanId);
         Assert.Equal("success", StringAttr(charge, "sagashop.payment.status"));
@@ -62,12 +63,15 @@ public class OtlpWireTests
         Assert.Equal("sagashop-order", Text(record, OtlpLogs.SourceHandleKey));
         Assert.Null(Text(record, OtlpLogs.RequestIdKey));
         Assert.True(record.BodyIsBytes);
-        var signal = ProducerCompletenessSignal.ParseFrom(record.BodyBytes!);
+        var signal = ProducerCompletenessSignal.Parser.ParseFrom(record.BodyBytes!);
         Assert.Equal(7UL, signal.SequenceEpoch);
+        Assert.True(signal.HasLastEmitted);
         Assert.Equal(2UL, signal.LastEmitted);
+        Assert.True(signal.HasCompleteThrough);
         Assert.Equal(2UL, signal.CompleteThrough);
+        Assert.True(signal.HasAcknowledgedFilterEpoch);
         Assert.Equal(4UL, signal.AcknowledgedFilterEpoch);
-        Assert.Equal(SourceActivityState.SourceActivityStateActive, signal.Activity);
+        Assert.Equal(SourceActivityState.Active, signal.Activity);
         Assert.Equal("unix", signal.ProducerReportedAt!.ClockDomainId);
         Assert.Equal(0UL, signal.ProducerReportedAt.UncertaintyNanoseconds);
         Assert.Equal(new System.Numerics.BigInteger(1_700_000_000_000_000_000), Int128Codec.ToBigInteger(signal.ProducerReportedAt.Nanoseconds));
@@ -79,8 +83,16 @@ public class OtlpWireTests
         using var receiver = OtlpLogReceiver.Start();
         Assert.Equal(200, receiver.Ingest(Golden("verdict.bin")));
         var verdict = Assert.Single(receiver.Verdicts);
-        Assert.False(string.IsNullOrEmpty(verdict.Id));
-        Assert.NotEqual(ReceivedVerdictOutcome.Unspecified, verdict.Outcome);
+        // verdict.bin is pinned by export/src/otlp_tests.rs (verdict_export_is_the_existing_message)
+        // from test_support::verdict(Shape::AuthoritativeClosed, BINDING, DETAIL) in
+        // export/src/test_support.rs: an Authoritative Violate whose id is
+        // "{SPEC_ID}:{SPEC_VERSION}:{BINDING}" and whose Assurance Envelope names SPEC_ID.
+        Assert.Equal("demo.spec.export.alpha:1.0.0:conv-9f3a-user@acme.example", verdict.Id);
+        Assert.Equal(VerdictOutcome.Violate, verdict.Outcome);
+        Assert.Equal(VerdictAuthority.Authoritative, verdict.Authority);
+        Assert.NotNull(verdict.Assurance);
+        Assert.Equal("demo.spec.export.alpha", verdict.Assurance.SpecificationId);
+        Assert.Equal("1.0.0", verdict.Assurance.SpecificationVersion);
 
         Assert.Equal(200, receiver.Ingest(Golden("event-filter.bin")));
         Assert.Single(receiver.Filters);
@@ -88,8 +100,8 @@ public class OtlpWireTests
         Assert.Equal(200, receiver.Ingest(Golden("decide-response.bin")));
         var decision = await receiver.WaitForDecisionAsync("req-charge-1", CancellationToken.None);
         Assert.Equal("req-charge-1", decision.RequestId);
-        Assert.Equal(DecisionAction.DecisionActionDeny, decision.Action);
-        Assert.Equal(DecisionAction.DecisionActionPermit, Assert.Single(decision.Specifications).Action);
+        Assert.Equal(DecisionAction.Deny, decision.Action);
+        Assert.Equal(DecisionAction.Permit, Assert.Single(decision.Specifications).Action);
     }
 
     [Fact]
@@ -99,14 +111,14 @@ public class OtlpWireTests
         var response = new DecideResponse
         {
             RequestId = "req-1",
-            Action = DecisionAction.DecisionActionUnspecified,
+            Action = DecisionAction.Unspecified,
         };
         var bytes = OtlpLogs.EncodeRecord(OtlpLogs.DecideResponseType, response.ToByteArray(), "req-1", null);
         Assert.Equal(400, receiver.Ingest(bytes));
         Assert.Empty(receiver.Verdicts);
 
-        response.Action = DecisionAction.DecisionActionPermit;
-        response.Specifications.Add(new SpecificationDecision { Action = DecisionAction.DecisionActionUnspecified });
+        response.Action = DecisionAction.Permit;
+        response.Specifications.Add(new SpecificationDecision { Action = DecisionAction.Unspecified });
         bytes = OtlpLogs.EncodeRecord(OtlpLogs.DecideResponseType, response.ToByteArray(), "req-1", null);
         Assert.Equal(400, receiver.Ingest(bytes));
     }
@@ -128,6 +140,21 @@ public class OtlpWireTests
         var response = await http.PostAsync(receiver.LogsUrl, content);
         Assert.True(response.IsSuccessStatusCode, response.StatusCode.ToString());
         Assert.Single(receiver.Verdicts);
+    }
+
+    // The receiver fails closed on a Verdict authority it cannot read, as the Verdict surface
+    // does (#371): Unspecified or an unknown value is refused, Provisional and Authoritative pass.
+    [Theory]
+    [InlineData(VerdictAuthority.Unspecified, 400)]
+    [InlineData((VerdictAuthority)99, 400)]
+    [InlineData(VerdictAuthority.Provisional, 200)]
+    [InlineData(VerdictAuthority.Authoritative, 200)]
+    public void ReceiverRefusesAVerdictWithoutAKnownAuthority(VerdictAuthority authority, int status)
+    {
+        using var receiver = OtlpLogReceiver.Start();
+        var verdict = new Verdict { Id = "spec:1.0.0:binding", Outcome = VerdictOutcome.Satisfy, Authority = authority };
+        Assert.Equal(status, receiver.Ingest(OtlpLogs.EncodeRecord(OtlpLogs.VerdictType, verdict.ToByteArray(), null, null)));
+        Assert.Equal(status == 200 ? 1 : 0, receiver.Verdicts.Count);
     }
 
     [Fact]
@@ -281,7 +308,7 @@ public class OtlpWireTests
                 SequenceNumber = (ulong)(i + 1),
                 SchemaVersion = "sagashop-contract-v1",
                 AcknowledgedFilterEpoch = 4,
-                ClaimedSensitivity = Sensitivity.SensitivityInternal,
+                ClaimedSensitivity = Sensitivity.Internal,
             };
             var reject = (parentHex != null && parentEvent == null) || linkMissing || unknownSentinel || nonFinite;
             if (reject)
@@ -299,7 +326,7 @@ public class OtlpWireTests
                 Sequence = new SequenceCoordinate { Epoch = 7, Sequence = (ulong)(i + 1) },
                 SchemaVersion = export.SchemaVersion,
                 AcknowledgedEpoch = 4,
-                ClaimedSensitivity = Sensitivity.SensitivityInternal,
+                ClaimedSensitivity = Sensitivity.Internal,
             });
             var decoded = Assert.Single(OtlpTraces.Decode(OtlpTraces.Encode(new[] { export }))).ToProducerEvent();
             AssertSame(expected, decoded);
@@ -338,7 +365,7 @@ public class OtlpWireTests
         var response = new DecideResponse
         {
             RequestId = "req-1",
-            Action = DecisionAction.DecisionActionPermit,
+            Action = DecisionAction.Permit,
         };
         Assert.Equal(200, receiver.Ingest(OtlpLogs.EncodeRecord(OtlpLogs.DecideResponseType, response.ToByteArray(), "req-1", null)));
         var outcome = await Gate.GateAsync(
@@ -435,7 +462,7 @@ public class OtlpWireTests
         SequenceNumber = 1,
         SchemaVersion = "sagashop-contract-v1",
         AcknowledgedFilterEpoch = 4,
-        ClaimedSensitivity = Sensitivity.SensitivityInternal,
+        ClaimedSensitivity = Sensitivity.Internal,
     };
 
     internal static ProducerCompletenessSignal SampleSignal(ulong last) 
@@ -453,7 +480,7 @@ public class OtlpWireTests
             CompleteThrough = last,
             ProducerReportedAt = when,
             AcknowledgedFilterEpoch = 1,
-            Activity = SourceActivityState.SourceActivityStateActive,
+            Activity = SourceActivityState.Active,
             ActivitySince = when,
         };
     }
@@ -471,6 +498,7 @@ public class OtlpWireTests
         Assert.Equal(expected.Id, actual.Id);
         Assert.Equal(expected.Kind, actual.Kind);
         Assert.Equal(expected.SchemaVersion, actual.SchemaVersion);
+        Assert.Equal(expected.HasAcknowledgedFilterEpoch, actual.HasAcknowledgedFilterEpoch);
         Assert.Equal(expected.AcknowledgedFilterEpoch, actual.AcknowledgedFilterEpoch);
         Assert.Equal(expected.Sequence?.Epoch, actual.Sequence?.Epoch);
         Assert.Equal(expected.Sequence?.Sequence, actual.Sequence?.Sequence);
@@ -490,7 +518,7 @@ public class OtlpWireTests
 
     private static void AssertValue(AttributeValue? expected, AttributeValue? actual)
     {
-        Assert.Equal(expected?.Case, actual?.Case);
+        Assert.Equal(expected?.ValueCase, actual?.ValueCase);
         if (expected == null || actual == null)
         {
             return;

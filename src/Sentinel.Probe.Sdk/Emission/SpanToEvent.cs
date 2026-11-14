@@ -6,6 +6,7 @@ using Emet.Sentinel.Model.V1;
 using Google.Protobuf;
 using Sentinel.Probe.Sdk.Int128;
 using Sentinel.Probe.Sdk.Otlp;
+using Sentinel.Probe.Sdk.Proto;
 
 // Span-to-event conversion — the .NET analog of sdk/go/emission/spantoevent.go
 // (mirrors span-to-event.ts).
@@ -57,7 +58,7 @@ public sealed class SpanConversion
     public List<SourceCapability> ClaimedCapabilities { get; init; } = new();
 
     /// <summary>The claimed sensitivity of the event.</summary>
-    public Sensitivity ClaimedSensitivity { get; init; } = Sensitivity.SensitivityUnspecified;
+    public Sensitivity ClaimedSensitivity { get; init; } = Sensitivity.Unspecified;
 
     /// <summary>The reserved sentinel.event.id the producer assigned at span start.</summary>
     public string? EventId { get; init; }
@@ -80,19 +81,21 @@ public static class SpanToEventConverter
     public static ProducerEvent SpanToEvent(SpanConversion conversion)
     {
         var activity = conversion.Activity;
-        return new ProducerEvent
+        var @event = new ProducerEvent
         {
             Id = conversion.EventId ?? "",
             Sequence = conversion.Sequence,
             SchemaVersion = conversion.SchemaVersion ?? "",
-            AcknowledgedFilterEpoch = conversion.AcknowledgedEpoch,
             Kind = activity.DisplayName,
             OccurrenceTime = BuildOccurrenceTime(activity),
-            Attributes = MapAttributes(activity.TagObjects),
-            ClaimedCapabilities = conversion.ClaimedCapabilities,
+            Attributes = { MapAttributes(activity.TagObjects) },
+            ClaimedCapabilities = { conversion.ClaimedCapabilities },
             ClaimedSensitivity = conversion.ClaimedSensitivity,
-            CausalPredecessorIds = CollectCausalPredecessors(activity),
+            CausalPredecessorIds = { CollectCausalPredecessors(activity) },
         };
+        // proto3 `optional`: a null acknowledged epoch stays absent rather than becoming 0.
+        @event.SetAcknowledgedFilterEpoch(conversion.AcknowledgedEpoch);
+        return @event;
     }
 
     /// <summary>
@@ -140,19 +143,19 @@ public static class SpanToEventConverter
             case null:
                 return null;
             case string s:
-                return new AttributeValue { Case = AttributeValueOneofCase.StringValue, StringValue = s };
+                return new AttributeValue { StringValue = s };
             case bool b:
-                return new AttributeValue { Case = AttributeValueOneofCase.BoolValue, BoolValue = b };
+                return new AttributeValue { BoolValue = b };
             case long l:
-                return new AttributeValue { Case = AttributeValueOneofCase.IntegerValue, IntegerValue = l };
+                return new AttributeValue { IntegerValue = l };
             case int i:
-                return new AttributeValue { Case = AttributeValueOneofCase.IntegerValue, IntegerValue = i };
+                return new AttributeValue { IntegerValue = i };
             case double d:
-                return new AttributeValue { Case = AttributeValueOneofCase.DoubleValue, DoubleValue = d };
+                return new AttributeValue { DoubleValue = d };
             case float f:
-                return new AttributeValue { Case = AttributeValueOneofCase.DoubleValue, DoubleValue = f };
+                return new AttributeValue { DoubleValue = f };
             case byte[] bytes:
-                return new AttributeValue { Case = AttributeValueOneofCase.BytesValue, BytesValue = ByteString.CopyFrom(bytes) };
+                return new AttributeValue { BytesValue = ByteString.CopyFrom(bytes) };
             case Array array:
                 return ArrayValue(array);
             case IDictionary<string, object?> dict:
@@ -175,8 +178,7 @@ public static class SpanToEventConverter
         }
         return new AttributeValue
         {
-            Case = AttributeValueOneofCase.ArrayValue,
-            ArrayValue = new AttributeArray { Values = values },
+            ArrayValue = new AttributeArray { Values = { values } },
         };
     }
 
@@ -191,8 +193,7 @@ public static class SpanToEventConverter
         }
         return new AttributeValue
         {
-            Case = AttributeValueOneofCase.MapValue,
-            MapValue = new AttributeMap { Entries = entries },
+            MapValue = new AttributeMap { Entries = { entries } },
         };
     }
 

@@ -20,8 +20,8 @@ public class SourceTierTests
     public void TierForHandleResolvesBothTiers()
     {
         var loaded = MustLoad(@"{""gateway.tool-calls"": {""tier"": ""ANCHOR""}, ""agent.runtime"": {""tier"": ""CONTRIBUTING""}}");
-        Assert.Equal(SourceTier.SourceTierAnchor, SourceTierLoader.TierForHandle(loaded, "gateway.tool-calls"));
-        Assert.Equal(SourceTier.SourceTierContributing, SourceTierLoader.TierForHandle(loaded, "agent.runtime"));
+        Assert.Equal(SourceTier.Anchor, SourceTierLoader.TierForHandle(loaded, "gateway.tool-calls"));
+        Assert.Equal(SourceTier.Contributing, SourceTierLoader.TierForHandle(loaded, "agent.runtime"));
     }
 
     [Fact]
@@ -99,8 +99,8 @@ public class SourceTierTests
     public void DottedHandlesAreValidKeys()
     {
         var loaded = MustLoad(@"{""gateway.tool-calls"": {""tier"": ""ANCHOR""}, ""agent.runtime.v2"": {""tier"": ""CONTRIBUTING""}}");
-        Assert.Equal(SourceTier.SourceTierAnchor, SourceTierLoader.TierForHandle(loaded, "gateway.tool-calls"));
-        Assert.Equal(SourceTier.SourceTierContributing, SourceTierLoader.TierForHandle(loaded, "agent.runtime.v2"));
+        Assert.Equal(SourceTier.Anchor, SourceTierLoader.TierForHandle(loaded, "gateway.tool-calls"));
+        Assert.Equal(SourceTier.Contributing, SourceTierLoader.TierForHandle(loaded, "agent.runtime.v2"));
     }
 
     // A host that decodes YAML/TOML hands the decoded map straight in.
@@ -112,7 +112,7 @@ public class SourceTierTests
             ["gateway.tool-calls"] = new Dictionary<string, object?> { ["tier"] = "ANCHOR", ["weight"] = 3L },
         };
         var loaded = SourceTierLoader.ParseSourceTierConfig(raw);
-        Assert.Equal(SourceTier.SourceTierAnchor, SourceTierLoader.TierForHandle(loaded, "gateway.tool-calls"));
+        Assert.Equal(SourceTier.Anchor, SourceTierLoader.TierForHandle(loaded, "gateway.tool-calls"));
         Assert.Equal(3L, loaded["gateway.tool-calls"].Extra["weight"]);
     }
 

@@ -13,7 +13,7 @@ public class ClientTests
     private sealed class StubDecider : ISentinelDecisionServiceClient
     {
         public DecideRequest? LastRequest;
-        public DecideResponse Response = new() { Action = DecisionAction.DecisionActionPermit };
+        public DecideResponse Response = new() { Action = DecisionAction.Permit };
         public Task<DecideResult> DecideAsync(DecideRequest request, CancellationToken cancellationToken)
         {
             LastRequest = request;
@@ -60,8 +60,10 @@ public class ClientTests
         Assert.Equal("req-9", req.RequestId);
         Assert.Equal("idem-9", req.IdempotencyKey);
         Assert.Equal("gateway.tool-calls", req.SourceHandle);
+        Assert.True(req.HasFilterEpoch);
         Assert.Equal(5UL, req.FilterEpoch);
         Assert.Same(@event, req.ProducerEvent);
+        Assert.True(req.HasRemainingTransportBudgetNanoseconds);
         Assert.Equal(1000UL, req.RemainingTransportBudgetNanoseconds);
     }
 
@@ -70,7 +72,7 @@ public class ClientTests
     {
         var c = NewClient(initial: new EventFilter { Epoch = 5 });
         var req = c.BuildDecideRequest(new ProducerEvent { Kind = "x" }, "r", "i", null);
-        Assert.Null(req.RemainingTransportBudgetNanoseconds);
+        Assert.False(req.HasRemainingTransportBudgetNanoseconds);
     }
 
     [Fact]
@@ -85,12 +87,12 @@ public class ClientTests
     [Fact]
     public async Task DecideFuncAdaptsTheDecider()
     {
-        var stub = new StubDecider { Response = new DecideResponse { Action = DecisionAction.DecisionActionDeny } };
+        var stub = new StubDecider { Response = new DecideResponse { Action = DecisionAction.Deny } };
         var c = NewClient(stub);
         var decide = c.DecideFunc();
         var outcome = await decide(c.BuildDecideRequest(new ProducerEvent { Kind = "x" }, "r", "i", null), CancellationToken.None);
         Assert.NotNull(outcome.Response);
-        Assert.Equal(DecisionAction.DecisionActionDeny, outcome.Response!.Action);
+        Assert.Equal(DecisionAction.Deny, outcome.Response!.Action);
         Assert.Null(outcome.Error);
         Assert.NotNull(stub.LastRequest);
     }

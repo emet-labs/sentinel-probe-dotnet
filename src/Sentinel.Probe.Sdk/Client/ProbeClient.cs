@@ -3,6 +3,7 @@ using System.Threading.Tasks;
 using Emet.Sentinel.Model.V1;
 using Emet.Sentinel.Probe.V1;
 using Sentinel.Probe.Sdk.Enforcement;
+using Sentinel.Probe.Sdk.Proto;
 
 namespace Sentinel.Probe.Sdk.Client;
 
@@ -76,15 +77,17 @@ public sealed class ProbeClient
         string idempotencyKey,
         ulong? remainingBudgetNs)
     {
-        return new DecideRequest
+        var request = new DecideRequest
         {
             RequestId = requestId,
             IdempotencyKey = idempotencyKey,
             SourceHandle = _config.SourceHandle,
-            FilterEpoch = _store.Epoch(),
             ProducerEvent = @event,
-            RemainingTransportBudgetNanoseconds = remainingBudgetNs,
         };
+        // Both fields are proto3 `optional`: null leaves them absent rather than 0.
+        request.SetFilterEpoch(_store.Epoch());
+        request.SetRemainingTransportBudgetNanoseconds(remainingBudgetNs);
+        return request;
     }
 
     /// <summary>Exposes the decision client so the enforcement gate can call it.</summary>

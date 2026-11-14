@@ -20,7 +20,7 @@ public sealed class SpanExport
     public required ulong SequenceNumber { get; init; }
     public required string SchemaVersion { get; init; }
     public required ulong AcknowledgedFilterEpoch { get; init; }
-    public Sensitivity ClaimedSensitivity { get; init; } = Sensitivity.SensitivityUnspecified;
+    public Sensitivity ClaimedSensitivity { get; init; } = Sensitivity.Unspecified;
     public IReadOnlyList<SourceCapability> ClaimedCapabilities { get; init; } = Array.Empty<SourceCapability>();
 }
 
@@ -153,7 +153,7 @@ public static class OtlpTraces
         string? schema = null;
         ulong? filterEpoch = null;
         string? parent = null;
-        Sensitivity sensitivity = Sensitivity.SensitivityUnspecified;
+        Sensitivity sensitivity = Sensitivity.Unspecified;
         bool sawSensitivity = false;
         var capabilities = new List<SourceCapability>();
         var attributes = new List<AttributeEntry>();
@@ -271,7 +271,7 @@ public static class OtlpTraces
         {
             throw new OtlpExportException("span is missing sentinel.acknowledged_filter_epoch");
         }
-        if (!sawSensitivity || sensitivity == Sensitivity.SensitivityUnspecified)
+        if (!sawSensitivity || sensitivity == Sensitivity.Unspecified)
         {
             throw new OtlpExportException("span is missing sentinel.claimed_sensitivity");
         }
@@ -281,13 +281,13 @@ public static class OtlpTraces
             Id = eventId,
             Sequence = new SequenceCoordinate { Epoch = epoch.Value, Sequence = sequence.Value },
             SchemaVersion = schema,
-            AcknowledgedFilterEpoch = filterEpoch,
+            AcknowledgedFilterEpoch = filterEpoch.Value,
             Kind = span.Name,
             OccurrenceTime = Occurrence(span.StartTimeUnixNano),
-            Attributes = attributes,
-            ClaimedCapabilities = capabilities,
+            Attributes = { attributes },
+            ClaimedCapabilities = { capabilities },
             ClaimedSensitivity = sensitivity,
-            CausalPredecessorIds = predecessors,
+            CausalPredecessorIds = { predecessors },
         };
     }
 
@@ -365,7 +365,7 @@ public static class OtlpTraces
         {
             throw new OtlpExportException("sentinel.schema.version is missing");
         }
-        if (export.ClaimedSensitivity == Sensitivity.SensitivityUnspecified)
+        if (export.ClaimedSensitivity == Sensitivity.Unspecified)
         {
             throw new OtlpExportException("sentinel.claimed_sensitivity is unspecified");
         }
@@ -694,28 +694,28 @@ public static class OtlpTraces
 
     private static string SensitivityName(Sensitivity value) => value switch
     {
-        Sensitivity.SensitivityPublic => "SENSITIVITY_PUBLIC",
-        Sensitivity.SensitivityInternal => "SENSITIVITY_INTERNAL",
-        Sensitivity.SensitivityConfidential => "SENSITIVITY_CONFIDENTIAL",
-        Sensitivity.SensitivityRestricted => "SENSITIVITY_RESTRICTED",
+        Sensitivity.Public => "SENSITIVITY_PUBLIC",
+        Sensitivity.Internal => "SENSITIVITY_INTERNAL",
+        Sensitivity.Confidential => "SENSITIVITY_CONFIDENTIAL",
+        Sensitivity.Restricted => "SENSITIVITY_RESTRICTED",
         _ => throw new OtlpExportException("sentinel.claimed_sensitivity is unspecified"),
     };
 
     private static string CapabilityName(SourceCapability value) => value switch
     {
-        SourceCapability.SourceCapabilityObserveBeforeEffect => "SOURCE_CAPABILITY_OBSERVE_BEFORE_EFFECT",
-        SourceCapability.SourceCapabilityCausalEdges => "SOURCE_CAPABILITY_CAUSAL_EDGES",
-        SourceCapability.SourceCapabilityCompletenessSignals => "SOURCE_CAPABILITY_COMPLETENESS_SIGNALS",
-        SourceCapability.SourceCapabilityBoundedClockUncertainty => "SOURCE_CAPABILITY_BOUNDED_CLOCK_UNCERTAINTY",
+        SourceCapability.ObserveBeforeEffect => "SOURCE_CAPABILITY_OBSERVE_BEFORE_EFFECT",
+        SourceCapability.CausalEdges => "SOURCE_CAPABILITY_CAUSAL_EDGES",
+        SourceCapability.CompletenessSignals => "SOURCE_CAPABILITY_COMPLETENESS_SIGNALS",
+        SourceCapability.BoundedClockUncertainty => "SOURCE_CAPABILITY_BOUNDED_CLOCK_UNCERTAINTY",
         _ => throw new OtlpExportException("claimed capability is unspecified"),
     };
 
     private static Sensitivity ParseSensitivity(string name) => name switch
     {
-        "SENSITIVITY_PUBLIC" => Sensitivity.SensitivityPublic,
-        "SENSITIVITY_INTERNAL" => Sensitivity.SensitivityInternal,
-        "SENSITIVITY_CONFIDENTIAL" => Sensitivity.SensitivityConfidential,
-        "SENSITIVITY_RESTRICTED" => Sensitivity.SensitivityRestricted,
+        "SENSITIVITY_PUBLIC" => Sensitivity.Public,
+        "SENSITIVITY_INTERNAL" => Sensitivity.Internal,
+        "SENSITIVITY_CONFIDENTIAL" => Sensitivity.Confidential,
+        "SENSITIVITY_RESTRICTED" => Sensitivity.Restricted,
         "SENSITIVITY_UNSPECIFIED" => throw new OtlpExportException("sentinel.claimed_sensitivity is unspecified"),
         _ => throw new OtlpExportException("unknown sentinel.claimed_sensitivity " + name),
     };
@@ -735,10 +735,10 @@ public static class OtlpTraces
             }
             capabilities.Add(name switch
             {
-                "SOURCE_CAPABILITY_OBSERVE_BEFORE_EFFECT" => SourceCapability.SourceCapabilityObserveBeforeEffect,
-                "SOURCE_CAPABILITY_CAUSAL_EDGES" => SourceCapability.SourceCapabilityCausalEdges,
-                "SOURCE_CAPABILITY_COMPLETENESS_SIGNALS" => SourceCapability.SourceCapabilityCompletenessSignals,
-                "SOURCE_CAPABILITY_BOUNDED_CLOCK_UNCERTAINTY" => SourceCapability.SourceCapabilityBoundedClockUncertainty,
+                "SOURCE_CAPABILITY_OBSERVE_BEFORE_EFFECT" => SourceCapability.ObserveBeforeEffect,
+                "SOURCE_CAPABILITY_CAUSAL_EDGES" => SourceCapability.CausalEdges,
+                "SOURCE_CAPABILITY_COMPLETENESS_SIGNALS" => SourceCapability.CompletenessSignals,
+                "SOURCE_CAPABILITY_BOUNDED_CLOCK_UNCERTAINTY" => SourceCapability.BoundedClockUncertainty,
                 _ => throw new OtlpExportException("unknown claimed capability " + name),
             });
         }
@@ -792,11 +792,11 @@ public static class OtlpTraces
         RejectNested(value);
         return value.Case switch
         {
-            OtlpValue.Shape.String => new AttributeValue { Case = AttributeValueOneofCase.StringValue, StringValue = value.String },
-            OtlpValue.Shape.Bool => new AttributeValue { Case = AttributeValueOneofCase.BoolValue, BoolValue = value.Bool },
-            OtlpValue.Shape.Int => new AttributeValue { Case = AttributeValueOneofCase.IntegerValue, IntegerValue = value.Int },
-            OtlpValue.Shape.Double => new AttributeValue { Case = AttributeValueOneofCase.DoubleValue, DoubleValue = value.Double },
-            OtlpValue.Shape.Bytes => new AttributeValue { Case = AttributeValueOneofCase.BytesValue, BytesValue = ByteString.CopyFrom(value.Bytes) },
+            OtlpValue.Shape.String => new AttributeValue { StringValue = value.String },
+            OtlpValue.Shape.Bool => new AttributeValue { BoolValue = value.Bool },
+            OtlpValue.Shape.Int => new AttributeValue { IntegerValue = value.Int },
+            OtlpValue.Shape.Double => new AttributeValue { DoubleValue = value.Double },
+            OtlpValue.Shape.Bytes => new AttributeValue { BytesValue = ByteString.CopyFrom(value.Bytes) },
             OtlpValue.Shape.Array => ArrayAttribute(value.Items),
             OtlpValue.Shape.Map => MapAttribute(value.Entries),
             _ => null,
@@ -816,8 +816,7 @@ public static class OtlpTraces
         }
         return new AttributeValue
         {
-            Case = AttributeValueOneofCase.ArrayValue,
-            ArrayValue = new AttributeArray { Values = items },
+            ArrayValue = new AttributeArray { Values = { items } },
         };
     }
 
@@ -838,8 +837,7 @@ public static class OtlpTraces
         }
         return new AttributeValue
         {
-            Case = AttributeValueOneofCase.MapValue,
-            MapValue = new AttributeMap { Entries = mapped },
+            MapValue = new AttributeMap { Entries = { mapped } },
         };
     }
 

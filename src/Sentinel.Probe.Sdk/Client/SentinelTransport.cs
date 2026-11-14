@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Emet.Sentinel.Probe.V1;
+using Google.Protobuf;
 using Sentinel.Probe.Sdk.Connect;
 
 namespace Sentinel.Probe.Sdk.Client;
@@ -86,7 +87,7 @@ public sealed class SentinelTransport : ISentinelDecisionServiceClient
             {
                 try
                 {
-                    return new DecideResult(DecideResponse.ParseFrom(body), null);
+                    return new DecideResult(DecideResponse.Parser.ParseFrom(body), null);
                 }
                 catch (Exception ex)
                 {

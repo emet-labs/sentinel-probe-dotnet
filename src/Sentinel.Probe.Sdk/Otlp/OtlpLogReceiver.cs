@@ -13,22 +13,6 @@ using Google.Protobuf;
 
 namespace Sentinel.Probe.Sdk.Otlp;
 
-/// <summary>Verdict outcome read from an OTLP log body. Unspecified is not a pass.</summary>
-public enum ReceivedVerdictOutcome
-{
-    Unspecified = 0,
-    Satisfy = 1,
-    Violate = 2,
-    Inconclusive = 3,
-}
-
-/// <summary>A Verdict the log receiver decoded. The id and outcome are the wire fields.</summary>
-public sealed class ReceivedVerdict
-{
-    public required string Id { get; init; }
-    public required ReceivedVerdictOutcome Outcome { get; init; }
-}
-
 /// <summary>
 /// Serves <c>POST /v1/logs</c> on <c>127.0.0.1</c>. Accepts identity and gzip
 /// <c>application/x-protobuf</c> and decodes Verdict, EventFilter, and DecideResponse.
@@ -42,7 +26,7 @@ public sealed class OtlpLogReceiver : IDisposable
     private readonly Thread _thread;
     private readonly int _port;
     private readonly object _gate = new();
-    private readonly List<ReceivedVerdict> _verdicts = new();
+    private readonly List<Verdict> _verdicts = new();
     private readonly List<EventFilter> _filters = new();
     private readonly Dictionary<string, DecideResponse> _decisions = new(StringComparer.Ordinal);
     private readonly Dictionary<string, TaskCompletionSource<DecideResponse>> _waiters = new(StringComparer.Ordinal);
@@ -68,13 +52,18 @@ public sealed class OtlpLogReceiver : IDisposable
         return new OtlpLogReceiver(listener, port);
     }
 
-    public IReadOnlyList<ReceivedVerdict> Verdicts
+    /// <summary>
+    /// Every Verdict received so far, decoded in full by the generated parser (#466). Each has a
+    /// non-empty id, an outcome of Satisfy, Violate or Inconclusive, and an authority of
+    /// Provisional or Authoritative; anything else was refused.
+    /// </summary>
+    public IReadOnlyList<Verdict> Verdicts
     {
         get
         {
             lock (_gate)
             {
-                return new List<ReceivedVerdict>(_verdicts);
+                return new List<Verdict>(_verdicts);
             }
         }
     }
@@ -173,7 +162,7 @@ public sealed class OtlpLogReceiver : IDisposable
 
     private void Apply(IReadOnlyList<DecodedLog> records)
     {
-        var verdicts = new List<ReceivedVerdict>();
+        var verdicts = new List<Verdict>();
         var filters = new List<EventFilter>();
         var decisions = new List<DecideResponse>();
         foreach (var record in records)
@@ -194,7 +183,7 @@ public sealed class OtlpLogReceiver : IDisposable
                     verdicts.Add(ReadVerdict(record.BodyBytes));
                     break;
                 case OtlpLogs.EventFilterType:
-                    filters.Add(EventFilter.ParseFrom(record.BodyBytes));
+                    filters.Add(EventFilter.Parser.ParseFrom(record.BodyBytes));
                     break;
                 case OtlpLogs.DecideResponseType:
                     decisions.Add(ReadDecision(record));
@@ -254,7 +243,7 @@ public sealed class OtlpLogReceiver : IDisposable
 
     private static DecideResponse ReadDecision(DecodedLog record)
     {
-        var response = DecideResponse.ParseFrom(record.BodyBytes ?? Array.Empty<byte>());
+        var response = DecideResponse.Parser.ParseFrom(record.BodyBytes ?? Array.Empty<byte>());
         var echoed = Attribute(record, OtlpLogs.RequestIdKey);
         if (string.IsNullOrWhiteSpace(response.RequestId) || echoed != response.RequestId)
         {
@@ -270,42 +259,33 @@ public sealed class OtlpLogReceiver : IDisposable
 
     private static void RequireAction(DecisionAction action, string what)
     {
-        if (action is not (DecisionAction.DecisionActionPermit or DecisionAction.DecisionActionDeny or DecisionAction.DecisionActionDefer))
+        if (action is not (DecisionAction.Permit or DecisionAction.Deny or DecisionAction.Defer))
         {
             throw new OtlpExportException(what + " is unspecified");
         }
     }
 
-    private static ReceivedVerdict ReadVerdict(byte[] body)
+    // The full Verdict, not just its id and outcome. Malformed bytes throw
+    // InvalidProtocolBufferException, which Ingest and the socket path turn into a 400.
+    private static Verdict ReadVerdict(byte[] body)
     {
-        string id = "";
-        var outcome = ReceivedVerdictOutcome.Unspecified;
-        using var input = new CodedInputStream(body);
-        uint tag;
-        while ((tag = input.ReadTag()) != 0)
-        {
-            switch (WireFormat.GetTagFieldNumber(tag))
-            {
-                case 1:
-                    id = input.ReadString();
-                    break;
-                case 2:
-                    outcome = (ReceivedVerdictOutcome)input.ReadInt32();
-                    break;
-                default:
-                    input.SkipLastField();
-                    break;
-            }
-        }
-        if (id.Length == 0)
+        var verdict = Verdict.Parser.ParseFrom(body);
+        if (verdict.Id.Length == 0)
         {
             throw new OtlpExportException("Verdict id is empty");
         }
-        if (outcome is not (ReceivedVerdictOutcome.Satisfy or ReceivedVerdictOutcome.Violate or ReceivedVerdictOutcome.Inconclusive))
+        // Unspecified, or an outcome this SDK does not know, is never a pass.
+        if (verdict.Outcome is not (VerdictOutcome.Satisfy or VerdictOutcome.Violate or VerdictOutcome.Inconclusive))
         {
             throw new OtlpExportException("Verdict outcome is unspecified");
         }
-        return new ReceivedVerdict { Id = id, Outcome = outcome };
+        // Fail closed on authority too, as the Verdict surface does (#371): an Unspecified or
+        // unknown authority cannot say whether this Verdict is settled.
+        if (verdict.Authority is not (VerdictAuthority.Provisional or VerdictAuthority.Authoritative))
+        {
+            throw new OtlpExportException("Verdict authority is unspecified");
+        }
+        return verdict;
     }
 
     private static string? Attribute(DecodedLog record, string key)

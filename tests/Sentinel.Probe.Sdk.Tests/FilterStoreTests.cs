@@ -6,7 +6,7 @@ namespace Sentinel.Probe.Sdk.Tests;
 
 public class FilterStoreTests
 {
-    private static EventFilter MakeFilter(ulong? epoch) => new() { Epoch = epoch };
+    private static EventFilter MakeFilter(ulong? epoch) => TestSupport.MakeFilter(epoch);
 
     private static ulong? U64(ulong v) => v;
 
@@ -121,6 +121,7 @@ public class FilterStoreTests
         Assert.NotNull(epoch);
         epoch = 99; // mutating the returned local must not reach the held filter
         Assert.Equal(5UL, store.Epoch());
+        Assert.True(filter.HasEpoch);
         Assert.Equal(5UL, filter.Epoch);
     }
 
@@ -136,6 +137,7 @@ public class FilterStoreTests
         store.Set(MakeFilter(U64(6)));
         Assert.Same(first, snapshot);
         Assert.NotSame(first, store.Get());
+        Assert.True(snapshot!.HasEpoch);
         Assert.Equal(5UL, snapshot!.Epoch);
     }
 

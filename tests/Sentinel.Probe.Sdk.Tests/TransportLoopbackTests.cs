@@ -26,7 +26,7 @@ public class TransportLoopbackTests
     [Fact]
     public async Task ConnectLoopbackDeny()
     {
-        using var server = new LoopbackServer(DecisionAction.DecisionActionDeny);
+        using var server = new LoopbackServer(DecisionAction.Deny);
         var outcome = await RunOverWire(server, TestSupport.MakeFilter(5UL, TestSupport.AskAndBlockSpec()), TestSupport.AlwaysOpen);
         Assert.Equal(OutcomeKind.Deny, outcome.Kind);
 
@@ -35,14 +35,16 @@ public class TransportLoopbackTests
         Assert.Equal("req-1", received.RequestId);
         Assert.Equal("idem-1", received.IdempotencyKey);
         Assert.Equal(TestSupport.TestKind, received.ProducerEvent!.Kind);
+        Assert.True(received.HasFilterEpoch);
         Assert.Equal(5UL, received.FilterEpoch);
+        Assert.True(received.HasRemainingTransportBudgetNanoseconds);
         Assert.Equal(10000UL, received.RemainingTransportBudgetNanoseconds);
     }
 
     [Fact]
     public async Task ConnectLoopbackPermit()
     {
-        using var server = new LoopbackServer(DecisionAction.DecisionActionPermit);
+        using var server = new LoopbackServer(DecisionAction.Permit);
         var outcome = await RunOverWire(server, TestSupport.MakeFilter(5UL, TestSupport.AskAndBlockSpec()), TestSupport.AlwaysOpen);
         Assert.Equal(OutcomeKind.Permit, outcome.Kind);
     }
@@ -52,7 +54,7 @@ public class TransportLoopbackTests
     [Fact]
     public async Task ConnectLoopbackServerErrorFailsClosed()
     {
-        using var server = new LoopbackServer(DecisionAction.DecisionActionPermit,
+        using var server = new LoopbackServer(DecisionAction.Permit,
             new ConnectException(ConnectCode.Unavailable, "sentinel unavailable"));
         var outcome = await RunOverWire(server, TestSupport.MakeFilter(5UL, TestSupport.ClosedAskAndBlockSpec()), TestSupport.AlwaysClosed);
         Assert.Equal(OutcomeKind.FailClosedDeny, outcome.Kind);
@@ -63,7 +65,7 @@ public class TransportLoopbackTests
     [Fact]
     public async Task ConnectLoopbackUnreachableEndpointFailsOpen()
     {
-        var dead = new LoopbackServer(DecisionAction.DecisionActionPermit);
+        var dead = new LoopbackServer(DecisionAction.Permit);
         string url = dead.BaseURL;
         dead.Dispose(); // stop the listener; nothing is listening any more
 
@@ -81,7 +83,7 @@ public class TransportLoopbackTests
     [Fact]
     public async Task ConnectLoopbackPreservesEventAttributes()
     {
-        using var server = new LoopbackServer(DecisionAction.DecisionActionPermit);
+        using var server = new LoopbackServer(DecisionAction.Permit);
         var transport = new SentinelTransport(new SentinelTransportOptions { BaseURL = server.BaseURL });
 
         var @event = new ProducerEvent
@@ -90,12 +92,12 @@ public class TransportLoopbackTests
             Kind = TestSupport.TestKind,
             SchemaVersion = "sentinel.model.v1",
             AcknowledgedFilterEpoch = 7,
-            Attributes = new()
+            Attributes =
             {
-                new AttributeEntry { Key = "amount", Value = new AttributeValue { Case = AttributeValueOneofCase.IntegerValue, IntegerValue = -4200 } },
-                new AttributeEntry { Key = "tag", Value = new AttributeValue { Case = AttributeValueOneofCase.StringValue, StringValue = "x" } },
+                new AttributeEntry { Key = "amount", Value = new AttributeValue { IntegerValue = -4200 } },
+                new AttributeEntry { Key = "tag", Value = new AttributeValue { StringValue = "x" } },
             },
-            ClaimedSensitivity = Sensitivity.SensitivityConfidential,
+            ClaimedSensitivity = Sensitivity.Confidential,
         };
         var request = new DecideRequest
         {
@@ -111,9 +113,10 @@ public class TransportLoopbackTests
 
         var received = Assert.Single(server.Requests);
         Assert.Equal("evt-9", received.ProducerEvent!.Id);
+        Assert.True(received.ProducerEvent!.HasAcknowledgedFilterEpoch);
         Assert.Equal(7UL, received.ProducerEvent!.AcknowledgedFilterEpoch);
         Assert.Equal(2, received.ProducerEvent!.Attributes.Count);
         Assert.Equal(-4200L, received.ProducerEvent!.Attributes[0].Value!.IntegerValue);
-        Assert.Equal(Sensitivity.SensitivityConfidential, received.ProducerEvent!.ClaimedSensitivity);
+        Assert.Equal(Sensitivity.Confidential, received.ProducerEvent!.ClaimedSensitivity);
     }
 }

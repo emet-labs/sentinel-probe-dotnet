@@ -21,9 +21,9 @@
   <ItemGroup>
     <!--
       Google.Protobuf pinned to 3.33.4 to match the BSR remote plugin
-      buf.build/protocolbuffers/csharp:v33.4 (S3 fix: exact versions, no floating ranges). The
-      hand-written messages in gen/ use CodedOutputStream/CodedInputStream for binary wire
-      compatibility, which are stable across the 3.x runtime.
+      buf.build/protocolbuffers/csharp:v33.4 (S3 fix: exact versions, no floating ranges). That
+      plugin writes the gitignored gen/ tree (tools/generate-dotnet-sdk.sh, run by the Justfile's
+      _sdk-dotnet-restore), and its output targets exactly this runtime: re-pin both together.
     -->
     <PackageReference Include="Google.Protobuf" Version="3.33.4" />
     <!--
@@ -38,18 +38,6 @@
   <!-- Tests reach internal helpers (FilterStore.EqualEpoch, SpecMatch). -->
   <ItemGroup>
     <InternalsVisibleTo Include="Sentinel.Probe.Sdk.Tests" />
-  </ItemGroup>
-
-  <!--
-    S2 fix: exclude generated-style proto code from TreatWarningsAsErrors by lowering its
-    warning level to 0. The gen/ tree mirrors what protoc-gen-csharp would emit and is
-    regenerated from proto/ by tools/generate-dotnet-sdk.sh; hand-checked-in here until the buf
-    pipeline runs in CI (see gen/README.md).
-  -->
-  <ItemGroup>
-    <Compile Update="gen/**/*.cs">
-      <WarningLevel>0</WarningLevel>
-    </Compile>
   </ItemGroup>
 
 </Project>

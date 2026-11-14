@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
@@ -16,6 +17,8 @@ namespace Sentinel.Probe.Sdk.Tests;
 
 public class OtlpRoundTripTests
 {
+    private const string ShipRequiresPriorCharge = "sagashop.p4.ship-requires-prior-charge";
+
     private static readonly DateTime Start = DateTimeOffset.FromUnixTimeMilliseconds(1_700_000_000_000).UtcDateTime;
     private static readonly DateTime End = Start.AddMilliseconds(5);
 
@@ -44,7 +47,21 @@ public class OtlpRoundTripTests
             parent: "01f0c0ffee-charge",
             new KeyValuePair<string, object?>("sagashop.order.id", "order-1001"));
         var verdicts = await session.WaitForVerdictsAsync();
-        Assert.Contains(verdicts, verdict => verdict.Id.Contains("sagashop.p4.ship-requires-prior-charge", StringComparison.Ordinal));
+        Assert.Contains(verdicts, verdict => verdict.Id.Contains(ShipRequiresPriorCharge, StringComparison.Ordinal));
+        var matched = verdicts.First(verdict => verdict.Id.Contains(ShipRequiresPriorCharge, StringComparison.Ordinal));
+        // The full Verdict now decodes (#466). The charge precedes the ship, so this Verdict must
+        // not be a Violate, and an Unspecified outcome or authority is never accepted. The first
+        // Verdict may be Provisional before an Authoritative one follows, so both authorities are
+        // admitted rather than pinning one observed run (observed: Authoritative Satisfy). An
+        // Authoritative Verdict on this evidence is settled, so it must be Satisfy.
+        Assert.Contains(matched.Outcome, new[] { VerdictOutcome.Satisfy, VerdictOutcome.Inconclusive });
+        Assert.Contains(matched.Authority, new[] { VerdictAuthority.Provisional, VerdictAuthority.Authoritative });
+        if (matched.Authority == VerdictAuthority.Authoritative)
+        {
+            Assert.Equal(VerdictOutcome.Satisfy, matched.Outcome);
+        }
+        Assert.NotNull(matched.Assurance);
+        Assert.Equal(ShipRequiresPriorCharge, matched.Assurance.SpecificationId);
     }
 
     [Fact]
@@ -71,7 +88,7 @@ public class OtlpRoundTripTests
             parent: null,
             new KeyValuePair<string, object?>("sagashop.order.id", "order-2002"));
         var verdicts = await session.WaitForVerdictsAsync();
-        Assert.DoesNotContain(verdicts, verdict => verdict.Outcome == ReceivedVerdictOutcome.Satisfy);
+        Assert.DoesNotContain(verdicts, verdict => verdict.Outcome == VerdictOutcome.Satisfy);
     }
 
     private static string? PeripheryBin()
@@ -163,12 +180,12 @@ public class OtlpRoundTripTests
                     SequenceNumber = 1,
                     SchemaVersion = "sagashop-contract-v1",
                     AcknowledgedFilterEpoch = 1,
-                    ClaimedSensitivity = Sensitivity.SensitivityInternal,
+                    ClaimedSensitivity = Sensitivity.Internal,
                 },
             }, CancellationToken.None);
         }
 
-        public async Task<IReadOnlyList<ReceivedVerdict>> WaitForVerdictsAsync()
+        public async Task<IReadOnlyList<Verdict>> WaitForVerdictsAsync()
         {
             await WaitUntilAsync(() => Receiver.Verdicts.Count > 0, "no Verdict log arrived");
             return Receiver.Verdicts;

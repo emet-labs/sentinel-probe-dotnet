@@ -1,4 +1,5 @@
 using Emet.Sentinel.Model.V1;
+using Sentinel.Probe.Sdk.Proto;
 
 namespace Sentinel.Probe.Sdk.Client;
 
@@ -63,7 +64,7 @@ public sealed class FilterStore
     public bool Set(EventFilter? filter)
     {
         EventFilter? held = _current;
-        if (held != null && EqualEpoch(held.Epoch, EpochOf(filter)))
+        if (held != null && EqualEpoch(EpochOf(held), EpochOf(filter)))
         {
             return false; // epoch unchanged and not the first set -> no update
         }
@@ -97,9 +98,13 @@ public sealed class FilterStore
         return a.GetValueOrDefault() == b.GetValueOrDefault();
     }
 
-    /// <summary>Nil-safe on the message itself, unlike a generated getter that flattens absent to 0.</summary>
+    /// <summary>
+    /// Nil-safe on the message itself, and presence-aware: the generated <c>Epoch</c> getter
+    /// flattens an absent epoch to 0, and <c>filter?.Epoch</c> would widen that 0 into a non-null
+    /// <c>ulong?</c> without a compiler diagnostic. Only <c>HasEpoch</c> tells the two apart.
+    /// </summary>
     private static ulong? EpochOf(EventFilter? filter)
     {
-        return filter?.Epoch;
+        return filter?.EpochOrNull();
     }
 }

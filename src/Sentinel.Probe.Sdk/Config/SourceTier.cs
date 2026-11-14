@@ -105,8 +105,8 @@ public static class SourceTierLoader
         }
         return entry.Tier switch
         {
-            SourceTierConstants.TierAnchor => SourceTier.SourceTierAnchor,
-            SourceTierConstants.TierContributing => SourceTier.SourceTierContributing,
+            SourceTierConstants.TierAnchor => SourceTier.Anchor,
+            SourceTierConstants.TierContributing => SourceTier.Contributing,
             // Unreachable via the constructors, but a caller can build a config literal by hand.
             _ => throw new FormatException($"source-tier: unknown tier \"{entry.Tier}\" for source_handle \"{sourceHandle}\""),
         };

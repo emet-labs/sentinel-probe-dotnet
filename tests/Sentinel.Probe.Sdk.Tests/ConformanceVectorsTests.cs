@@ -171,19 +171,19 @@ public class ConformanceVectorsTests
                 foreach (var fixture in fixtureFilter.GetProperty("specifications").EnumerateArray())
                 {
                     var id = fixture.GetProperty("id").GetString()!;
-                    accepted[id] = fixture.GetProperty("accepted_fail_mode").GetString() == "closed" ? FailMode.FailModeClosed : FailMode.FailModeOpen;
+                    accepted[id] = fixture.GetProperty("accepted_fail_mode").GetString() == "closed" ? FailMode.Closed : FailMode.Open;
                     var match = new EventMatch
                     {
-                        DeliveryMode = fixture.GetProperty("delivery_mode").GetString() == "ask_and_block" ? DeliveryMode.DeliveryModeAskAndBlock : DeliveryMode.DeliveryModeShipAsync,
+                        DeliveryMode = fixture.GetProperty("delivery_mode").GetString() == "ask_and_block" ? DeliveryMode.AskAndBlock : DeliveryMode.ShipAsync,
                     };
                     match.EventKinds.AddRange(fixture.GetProperty("event_kinds").EnumerateArray().Select(value => value.GetString()!));
                     filter.Specifications.Add(new SpecificationFilter
                     {
                         SpecificationId = id,
                         EventMatch = match,
-                        FailMode = fixture.GetProperty("fail_mode").GetString() == "closed" ? FailMode.FailModeClosed : FailMode.FailModeOpen,
-                        EvaluationMode = EvaluationMode.EvaluationModeEnforce,
-                        Readiness = Readiness.ReadinessActive,
+                        FailMode = fixture.GetProperty("fail_mode").GetString() == "closed" ? FailMode.Closed : FailMode.Open,
+                        EvaluationMode = EvaluationMode.Enforce,
+                        Readiness = Readiness.Active,
                         LatencyBudgetNanoseconds = ulong.Parse(fixture.GetProperty("latency_budget_ns").GetString()!),
                     });
                 }
@@ -194,10 +194,10 @@ public class ConformanceVectorsTests
             var decider = vector.GetProperty("decider").GetProperty("result").GetString()!;
             var actions = new Dictionary<string, DecisionAction>
             {
-                ["permit"] = DecisionAction.DecisionActionPermit,
-                ["deny"] = DecisionAction.DecisionActionDeny,
-                ["defer"] = DecisionAction.DecisionActionDefer,
-                ["unspecified"] = DecisionAction.DecisionActionUnspecified,
+                ["permit"] = DecisionAction.Permit,
+                ["deny"] = DecisionAction.Deny,
+                ["defer"] = DecisionAction.Defer,
+                ["unspecified"] = DecisionAction.Unspecified,
             };
             var outcome = await Gate.GateAsync(
                 new ProducerEvent { Id = "fixture-event", Kind = vector.GetProperty("event").GetProperty("kind").GetString()! },
@@ -296,10 +296,13 @@ public class ConformanceVectorsTests
         Assert.Equal(OtlpLogs.CompletenessType, LogText(record, OtlpLogs.PayloadTypeKey));
         Assert.Equal(want.GetProperty("source_handle").GetString(), LogText(record, OtlpLogs.SourceHandleKey));
         Assert.NotNull(record.BodyBytes);
-        var signal = ProducerCompletenessSignal.ParseFrom(record.BodyBytes);
+        var signal = ProducerCompletenessSignal.Parser.ParseFrom(record.BodyBytes);
         Assert.Equal(ulong.Parse(want.GetProperty("sequence_epoch").GetString()!), signal.SequenceEpoch);
+        Assert.True(signal.HasLastEmitted);
         Assert.Equal(ulong.Parse(want.GetProperty("last_emitted").GetString()!), signal.LastEmitted);
+        Assert.True(signal.HasCompleteThrough);
         Assert.Equal(ulong.Parse(want.GetProperty("complete_through").GetString()!), signal.CompleteThrough);
+        Assert.True(signal.HasAcknowledgedFilterEpoch);
         Assert.Equal(ulong.Parse(want.GetProperty("acknowledged_filter_epoch").GetString()!), signal.AcknowledgedFilterEpoch);
         Assert.NotNull(signal.ProducerReportedAt);
         Assert.NotNull(signal.ProducerReportedAt.Nanoseconds);
@@ -325,8 +328,9 @@ public class ConformanceVectorsTests
         var record = Assert.Single(OtlpLogs.Decode(bytes));
         Assert.Equal(OtlpLogs.EventFilterType, LogText(record, OtlpLogs.PayloadTypeKey));
         Assert.NotNull(record.BodyBytes);
-        var filter = EventFilter.ParseFrom(record.BodyBytes);
-        Assert.Equal((ulong?)ulong.Parse(want.GetProperty("epoch").GetString()!), filter.Epoch);
+        var filter = EventFilter.Parser.ParseFrom(record.BodyBytes);
+        Assert.True(filter.HasEpoch);
+        Assert.Equal(ulong.Parse(want.GetProperty("epoch").GetString()!), filter.Epoch);
         Assert.Equal(
             want.GetProperty("specification_ids").EnumerateArray().Select(item => item.GetString()).ToArray(),
             filter.Specifications.Select(spec => spec.SpecificationId).ToArray());
@@ -339,7 +343,7 @@ public class ConformanceVectorsTests
         Assert.Equal(OtlpLogs.DecideResponseType, LogText(record, OtlpLogs.PayloadTypeKey));
         Assert.Equal(want.GetProperty("request_id").GetString(), LogText(record, OtlpLogs.RequestIdKey));
         Assert.NotNull(record.BodyBytes);
-        var decision = DecideResponse.ParseFrom(record.BodyBytes);
+        var decision = DecideResponse.Parser.ParseFrom(record.BodyBytes);
         Assert.Equal(want.GetProperty("request_id").GetString(), decision.RequestId);
         Assert.Equal(Action(want.GetProperty("action").GetString()!), decision.Action);
         var specs = want.GetProperty("specifications").EnumerateArray().ToArray();
@@ -381,24 +385,24 @@ public class ConformanceVectorsTests
 
     private static SourceActivityState Activity(string token) => token switch
     {
-        "active" => SourceActivityState.SourceActivityStateActive,
-        "idle" => SourceActivityState.SourceActivityStateIntentionallyIdle,
+        "active" => SourceActivityState.Active,
+        "idle" => SourceActivityState.IntentionallyIdle,
         _ => throw new InvalidOperationException(token),
     };
 
-    private static ReceivedVerdictOutcome Outcome(string token) => token switch
+    private static VerdictOutcome Outcome(string token) => token switch
     {
-        "satisfy" => ReceivedVerdictOutcome.Satisfy,
-        "violate" => ReceivedVerdictOutcome.Violate,
-        "inconclusive" => ReceivedVerdictOutcome.Inconclusive,
+        "satisfy" => VerdictOutcome.Satisfy,
+        "violate" => VerdictOutcome.Violate,
+        "inconclusive" => VerdictOutcome.Inconclusive,
         _ => throw new InvalidOperationException(token),
     };
 
     private static DecisionAction Action(string token) => token switch
     {
-        "permit" => DecisionAction.DecisionActionPermit,
-        "deny" => DecisionAction.DecisionActionDeny,
-        "defer" => DecisionAction.DecisionActionDefer,
+        "permit" => DecisionAction.Permit,
+        "deny" => DecisionAction.Deny,
+        "defer" => DecisionAction.Defer,
         _ => throw new InvalidOperationException(token),
     };
 }
