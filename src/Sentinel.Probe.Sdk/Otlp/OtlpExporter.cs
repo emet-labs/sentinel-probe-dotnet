@@ -79,12 +79,19 @@ public sealed class OtlpExporter : IDisposable
     /// ExportTraceServiceResponse (<see cref="PartialSuccess"/>). The export succeeded only when it
     /// returns 0. A non-2xx status or an undecodable 2xx body throws <see cref="OtlpExportException"/>.
     /// </summary>
-    public async Task<long> ExportSpansCheckedAsync(string sourceHandle, IReadOnlyList<SpanExport> spans, CancellationToken cancellationToken)
+    public async Task<long> ExportSpansCheckedAsync(string sourceHandle, IReadOnlyList<SpanExport> spans, CancellationToken cancellationToken) =>
+        (await ExportSpansOutcomeAsync(sourceHandle, spans, cancellationToken).ConfigureAwait(false)).RejectedSpans;
+
+    /// <summary>
+    /// <see cref="ExportSpansCheckedAsync"/> that also returns Sentinel's <c>error_message</c>, so a caller can
+    /// tell a refused duplicate Event id from another rejection.
+    /// </summary>
+    public async Task<PartialSuccessRejection> ExportSpansOutcomeAsync(string sourceHandle, IReadOnlyList<SpanExport> spans, CancellationToken cancellationToken)
     {
         var body = await PostAsync(_tracesUrl, sourceHandle, OtlpTraces.Encode(spans, _resourceAttributes), cancellationToken).ConfigureAwait(false);
         try
         {
-            return PartialSuccess.RejectedSpans(body);
+            return PartialSuccess.Rejection(body);
         }
         catch (FormatException ex)
         {

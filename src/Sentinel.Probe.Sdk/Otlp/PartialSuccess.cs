@@ -21,10 +21,18 @@ public static class PartialSuccess
 {
     /// <summary>Returns the rejected span count of a 2xx trace export body.</summary>
     /// <exception cref="FormatException">The body is not a valid ExportTraceServiceResponse.</exception>
-    public static long RejectedSpans(byte[] body)
+    public static long RejectedSpans(byte[] body) => Rejection(body).RejectedSpans;
+
+    /// <summary>
+    /// Returns the rejected span count and <c>error_message</c> (<c>ExportTracePartialSuccess.error_message = 2</c>)
+    /// of a 2xx trace export body.
+    /// </summary>
+    /// <exception cref="FormatException">The body is not a valid ExportTraceServiceResponse.</exception>
+    public static PartialSuccessRejection Rejection(byte[] body)
     {
         ArgumentNullException.ThrowIfNull(body);
         ulong rejected = 0;
+        var message = string.Empty;
         var position = 0;
         while (position < body.Length)
         {
@@ -32,7 +40,7 @@ public static class PartialSuccess
             if (field == 1 && wireType == 2)
             {
                 var (start, end) = LengthDelimited(body, ref position);
-                rejected = Partial(body, start, end, rejected);
+                (rejected, message) = Partial(body, start, end, rejected, message);
             }
             else
             {
@@ -43,12 +51,12 @@ public static class PartialSuccess
         {
             throw new FormatException("rejected_spans is negative");
         }
-        return (long)rejected;
+        return new PartialSuccessRejection((long)rejected, message);
     }
 
     // ExportTracePartialSuccess in body[start, end). Repeated occurrences merge: the last
-    // rejected_spans seen wins.
-    private static ulong Partial(byte[] body, int start, int end, ulong rejected)
+    // rejected_spans and error_message seen win.
+    private static (ulong Rejected, string Message) Partial(byte[] body, int start, int end, ulong rejected, string message)
     {
         var position = start;
         while (position < end)
@@ -58,12 +66,17 @@ public static class PartialSuccess
             {
                 rejected = Varint(body, ref position, end);
             }
+            else if (field == 2 && wireType == 2)
+            {
+                var (textStart, textEnd) = LengthDelimited(body, ref position, end);
+                message = System.Text.Encoding.UTF8.GetString(body, textStart, textEnd - textStart);
+            }
             else
             {
                 Skip(body, ref position, end, wireType);
             }
         }
-        return rejected;
+        return (rejected, message);
     }
 
     private static (ulong Field, int WireType) Tag(byte[] body, ref int position, int? end = null)
@@ -143,4 +156,19 @@ public static class PartialSuccess
         }
         throw new FormatException("varint longer than ten bytes");
     }
+}
+
+/// <summary>Sentinel's <c>partial_success</c>: the rejected span count and its <c>error_message</c>.</summary>
+/// <param name="RejectedSpans">The rejected span count.</param>
+/// <param name="ErrorMessage">Sentinel's message, empty when there is none.</param>
+public sealed record PartialSuccessRejection(long RejectedSpans, string ErrorMessage)
+{
+    /// <summary>
+    /// Sentinel already holds an Event under the refused id (<c>evidence_conflict</c> or
+    /// <c>identity_conflict</c>).
+    /// </summary>
+    public bool IsDuplicateEventId =>
+        RejectedSpans > 0
+        && (ErrorMessage.Contains("evidence_conflict", StringComparison.Ordinal)
+            || ErrorMessage.Contains("identity_conflict", StringComparison.Ordinal));
 }

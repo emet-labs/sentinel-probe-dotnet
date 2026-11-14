@@ -25,6 +25,12 @@ namespace Sentinel.Probe.Sdk.Emission;
 //   * Transport errors (no response, timeout, HTTP 408/429/5xx) are retried with exponential backoff
 //     up to MaxAttempts, then FAILED. A deterministic refusal (validation, other 4xx, rejected spans)
 //     is FAILED at once: resending the same Events cannot change it.
+//   * DUPLICATE EVENT ID POLICY: when Sentinel refuses a second delivery of an Event id it holds
+//     (evidence_conflict / identity_conflict), OnError receives ExportFailureKind.DuplicateEventId
+//     (reason "duplicate-event-id"), the slot stays FAILED, complete_through never passes it (missing
+//     evidence never looks complete) and nothing is retried. Any other rejection (slot_conflict) also
+//     stays FAILED. A rejected batch of several Events is resent one by one so a refusal fails only
+//     the Event it names.
 //   * ShutdownAsync stops intake, waits until every queued Event is exported or FAILED, and only then
 //     sends the final completeness declaration.
 
@@ -48,6 +54,13 @@ public enum ExportFailureKind
 
     /// <summary>Sentinel's 2xx response rejected one or more spans.</summary>
     Rejected,
+
+    /// <summary>
+    /// Sentinel already holds an Event under this id and refused the redelivery (<c>evidence_conflict</c> or
+    /// <c>identity_conflict</c>). The slot stays FAILED, <c>complete_through</c> does not pass it and the
+    /// refusal is not retried. The wire reason is <c>duplicate-event-id</c>.
+    /// </summary>
+    DuplicateEventId,
 
     /// <summary>Any other unexpected error.</summary>
     Unexpected,
@@ -390,7 +403,8 @@ public sealed class OtlpExportingSpanProcessor : BaseProcessor<Activity>
         {
             try
             {
-                var rejected = await _exporter.ExportSpansCheckedAsync(_handle, spans, CancellationToken.None).ConfigureAwait(false);
+                var outcome = await _exporter.ExportSpansOutcomeAsync(_handle, spans, CancellationToken.None).ConfigureAwait(false);
+                var rejected = outcome.RejectedSpans;
                 if (rejected == 0)
                 {
                     foreach (var item in good)
@@ -398,6 +412,22 @@ public sealed class OtlpExportingSpanProcessor : BaseProcessor<Activity>
                         _sequence.MarkExported(item.Slot);
                     }
                     Interlocked.Add(ref _exported, good.Count);
+                    return;
+                }
+                if (good.Count > 1)
+                {
+                    // One refused Event must not fail its neighbours: resend one by one.
+                    foreach (var item in good)
+                    {
+                        await ExportBatchAsync(new List<Item> { item }).ConfigureAwait(false);
+                    }
+                    return;
+                }
+                if (outcome.IsDuplicateEventId)
+                {
+                    Fail(Slots(good), ExportFailureKind.DuplicateEventId, new OtlpExportException(
+                        "Sentinel already holds an Event under this id and refused the redelivery ("
+                        + outcome.ErrorMessage + "); the slot stays FAILED (duplicate-event-id)"));
                     return;
                 }
                 Fail(Slots(good), ExportFailureKind.Rejected, new OtlpExportException(

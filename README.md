@@ -66,7 +66,13 @@ await processor.ShutdownAsync(heartbeat, ct);
 - **Retries.** Transport errors (no response, timeout, HTTP 408/429/5xx) are retried with exponential
   backoff (`RetryBaseDelay` 250 ms, capped at `RetryMaxDelay`) up to `MaxAttempts` (3), then FAILED.
   Validation errors, other 4xx answers and `rejected_spans` are deterministic: FAILED at once, not
-  retried. Each Event is validated alone first, so one bad span does not fail its batch.
+  retried. Each Event is validated alone first, so one bad span does not fail its batch, and a
+  batch Sentinel rejects is resent one Event at a time so a refusal fails only the Event it names.
+- **Duplicate Event id.** When Sentinel refuses a second delivery of an Event id it holds
+  (`evidence_conflict`, `identity_conflict`), `OnError` receives `ExportFailureKind.DuplicateEventId`
+  (reason `duplicate-event-id`), the slot stays FAILED, `complete_through` never passes it and
+  nothing is retried: the slot number never reached Sentinel as an Event, so completeness through it
+  would be overstated. Any other rejection (`slot_conflict`) also stays FAILED.
 - **Shutdown.** `ShutdownAsync(heartbeat)` stops intake, waits until every queued Event is exported
   or FAILED, then sends the heartbeat's final declaration. `Dispose` only stops intake.
 

@@ -448,6 +448,70 @@ public class ExportingProcessorTests
         Assert.Equal(ExportFailureKind.Rejected, rig.Failures.Single().Kind);
     }
 
+    // ExportTraceServiceResponse{partial_success{rejected_spans=1, error_message=text}}
+    private static byte[] Refusal(string text)
+    {
+        var message = System.Text.Encoding.UTF8.GetBytes(text);
+        var inner = new List<byte> { 0x08, 0x01, 0x12, (byte)message.Length };
+        inner.AddRange(message);
+        var body = new List<byte> { 0x0a, (byte)inner.Count };
+        body.AddRange(inner);
+        return body.ToArray();
+    }
+
+    [Theory]
+    [InlineData("evidence_conflict")]
+    [InlineData("identity_conflict")]
+    public async Task a_refused_duplicate_event_id_keeps_the_slot_failed_and_is_not_retried(string kind)
+    {
+        var refusal = Refusal("append_events conflicted: " + kind);
+        var handler = new Handler((_, n) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new ByteArrayContent(n == 2 ? refusal : Array.Empty<byte>()),
+        }));
+        using var rig = new Rig(handler, maxBatch: 1);
+        rig.Emit();
+        rig.Emit(); // slot 2: the second delivery of an Event id Sentinel holds, refused
+        rig.Emit();
+        await rig.Processor.ShutdownAsync();
+        Assert.Equal(3, handler.Calls); // the refusal is not retried
+        var failure = rig.Failures.Single();
+        Assert.Equal(ExportFailureKind.DuplicateEventId, failure.Kind);
+        Assert.Equal(new[] { 2UL }, failure.Slots.Select(slot => slot.Number).ToArray());
+        // Slots 1 and 3 exported, slot 2 FAILED: complete_through stops at 1.
+        Assert.Equal((3UL, 1UL), (rig.Declaration.LastEmitted, rig.Declaration.CompleteThrough));
+    }
+
+    [Fact]
+    public async Task slot_conflict_also_stays_failed_as_a_plain_rejection()
+    {
+        var refusal = Refusal("append_events conflicted: slot_conflict");
+        var handler = new Handler((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(refusal) }));
+        using var rig = new Rig(handler);
+        rig.Emit();
+        await rig.Processor.ShutdownAsync();
+        Assert.Equal(1, handler.Calls);
+        Assert.Equal(ExportFailureKind.Rejected, rig.Failures.Single().Kind);
+        Assert.Equal(0UL, rig.Declaration.CompleteThrough);
+    }
+
+    [Fact]
+    public async Task a_rejected_batch_is_resent_one_by_one_so_a_refusal_fails_only_its_event()
+    {
+        var refusal = Refusal("append_events conflicted: evidence_conflict");
+        // Request 1 is the batch of three (rejected as a whole); then one request per Event.
+        var handler = new Handler((_, n) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new ByteArrayContent(n == 1 || n == 3 ? refusal : Array.Empty<byte>()),
+        }));
+        using var rig = new Rig(handler, maxBatch: 8);
+        for (var i = 0; i < 3; i++) rig.Emit();
+        await rig.Processor.ShutdownAsync();
+        Assert.Equal(4, handler.Calls);
+        Assert.Equal(ExportFailureKind.DuplicateEventId, rig.Failures.Single().Kind);
+        Assert.Equal((3UL, 1UL), (rig.Declaration.LastEmitted, rig.Declaration.CompleteThrough));
+    }
+
     [Fact]
     public async Task one_invalid_span_does_not_sink_its_batch()
     {
