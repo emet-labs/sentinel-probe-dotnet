@@ -42,5 +42,5 @@ plugins:
   # Google.Protobuf 3.33.4 runtime pinned in src/Sentinel.Probe.Sdk/Sentinel.Probe.Sdk.csproj.
   - remote: buf.build/protocolbuffers/csharp:v33.4
     revision: 1
-    out: sdk/dotnet/src/Sentinel.Probe.Sdk/gen
+    out: src/Sentinel.Probe.Sdk/gen
     opt: base_namespace=Emet.Sentinel

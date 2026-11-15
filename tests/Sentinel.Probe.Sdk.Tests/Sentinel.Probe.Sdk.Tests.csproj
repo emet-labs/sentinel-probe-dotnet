@@ -17,7 +17,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="../../../../testdata/probe-sdk-conformance/**/*.json"
+    <Content Include="../../testdata/probe-sdk-conformance/**/*.json"
              Link="probe-sdk-conformance/%(RecursiveDir)%(Filename)%(Extension)"
              CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
