@@ -81,6 +81,128 @@ public class CompletenessHeartbeatTests
         Assert.Equal(10L, (long)Int128Codec.ToBigInteger(signal.ActivitySince.Nanoseconds));
     }
 
+    private static long NanosOf(OccurrenceTime time) => (long)Int128Codec.ToBigInteger(time.Nanoseconds);
+
+    private void HookEntryThenExport(bool exported = true)
+    {
+        _sequence.NoteAttempt();
+        var slot = _sequence.Allocate();
+        if (exported)
+        {
+            _sequence.MarkExported(slot);
+        }
+    }
+
+    [Fact]
+    public void ALegacyDeclarationSendsNoneOfTheFourEpochChainFields()
+    {
+        var signal = CompletenessSignals.Build(new EpochDeclaration(7, 3, 1), 0, SourceActivityState.Active, 20, 10);
+        Assert.False(signal.HasAttempted);
+        Assert.False(signal.HasPredecessorEpoch);
+        Assert.Null(signal.SealedAt);
+        Assert.False(signal.HasSuperseded);
+    }
+
+    [Fact]
+    public async Task AFreshEpochRowCarriesAttemptedAndNoPredecessorSealedAtOrSuperseded()
+    {
+        HookEntryThenExport(exported: false);
+        await Heartbeat().ReportAsync();
+        var signal = Assert.Single(_sent);
+        Assert.True(signal.HasAttempted);
+        Assert.Equal(1UL, signal.Attempted);
+        Assert.False(signal.HasPredecessorEpoch);
+        Assert.Null(signal.SealedAt);
+        Assert.False(signal.HasSuperseded);
+    }
+
+    [Fact]
+    public async Task ALostAttemptShowsAttemptedAboveLastEmittedOnTheWire()
+    {
+        HookEntryThenExport();
+        _sequence.NoteAttempt(); // the hook entry failed before Allocate()
+        await Heartbeat().ReportAsync();
+        var signal = Assert.Single(_sent);
+        Assert.Equal(1UL, signal.LastEmitted);
+        Assert.Equal(2UL, signal.Attempted);
+    }
+
+    [Fact]
+    public async Task AllocateCloseAllocateRollsWithThePredecessorAndResendsTheUnacceptedSealedEpochSuperseded()
+    {
+        var seen = new List<ProducerCompletenessSignal>();
+        var refuse = true;
+        var heartbeat = Heartbeat(send: (signal, ct) =>
+        {
+            seen.Add(signal);
+            if (refuse)
+            {
+                return Task.FromException(new Sentinel.Probe.Sdk.Otlp.OtlpExportException("HTTP 503"));
+            }
+            return Record(signal, ct);
+        });
+        var first = _sequence.Epoch();
+        HookEntryThenExport();
+        _clock.SetUnixMilliseconds(StartMs + 1);
+        await heartbeat.ReportAsync();
+        var sealedRow = Assert.Single(seen);
+        Assert.NotNull(sealedRow.SealedAt);
+        var sealedAt = NanosOf(sealedRow.SealedAt);
+        Assert.Equal(NanosOf(sealedRow.ProducerReportedAt), sealedAt);
+        refuse = false;
+        _clock.SetUnixMilliseconds(StartMs + 6);
+        HookEntryThenExport(exported: false);
+        await heartbeat.ReportAsync();
+        Assert.Equal(2, _sent.Count);
+        var resend = _sent[0];
+        var current = _sent[1];
+        Assert.Equal(first, resend.SequenceEpoch);
+        Assert.True(resend.HasSuperseded && resend.Superseded);
+        Assert.Equal(sealedAt, NanosOf(resend.SealedAt));
+        Assert.Equal(sealedRow.Attempted, resend.Attempted);
+        Assert.Equal(sealedRow.LastEmitted, resend.LastEmitted);
+        Assert.True(NanosOf(resend.ProducerReportedAt) >= sealedAt);
+        Assert.False(resend.HasPredecessorEpoch);
+        Assert.Equal(first, current.PredecessorEpoch);
+        Assert.False(current.HasSuperseded);
+        Assert.Null(current.SealedAt);
+        Assert.Equal(1UL, current.Attempted);
+    }
+
+    [Fact]
+    public async Task SealedAtIsConstantAcrossIdleRedeclarationsAndNotAfterAnyLaterReport()
+    {
+        var heartbeat = Heartbeat();
+        HookEntryThenExport();
+        await heartbeat.ReportAsync();
+        var sealedAt = NanosOf(Assert.Single(_sent).SealedAt);
+        for (var i = 1; i <= 3; i++)
+        {
+            _clock.SetUnixMilliseconds(StartMs + (i * 1_000));
+            await heartbeat.ReportAsync();
+        }
+        Assert.Equal(4, _sent.Count);
+        foreach (var signal in _sent)
+        {
+            Assert.Equal(sealedAt, NanosOf(signal.SealedAt));
+            Assert.True(sealedAt <= NanosOf(signal.ProducerReportedAt));
+        }
+    }
+
+    [Fact]
+    public async Task ARowIsNeverReportedBeforeTheInstantItsEpochWasSealedEvenOnAnotherClock()
+    {
+        var ahead = ManualTimeProvider.AtUnixMilliseconds(StartMs + 10_000);
+        var sequence = new SequenceAllocator(ahead);
+        sequence.NoteAttempt();
+        sequence.MarkExported(sequence.Allocate());
+        var heartbeat = new CompletenessHeartbeat(sequence, Record, null, _clock, TimeSpan.Zero);
+        await heartbeat.ReportAsync();
+        var signal = Assert.Single(_sent);
+        Assert.True(NanosOf(signal.SealedAt) <= NanosOf(signal.ProducerReportedAt));
+    }
+
+
     [Fact]
     public async Task ASendThatThrowsIsReportedAndIsNotAccepted()
     {

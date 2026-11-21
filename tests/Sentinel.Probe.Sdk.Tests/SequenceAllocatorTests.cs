@@ -21,6 +21,8 @@ public class SequenceAllocatorTests
 
     private static EpochDeclaration Counters(SequenceDeclaration d) => new(d.Epoch, d.LastEmitted, d.CompleteThrough);
 
+    private static EpochDeclaration Strip(EpochDeclaration d) => new(d.Epoch, d.LastEmitted, d.CompleteThrough);
+
     [Fact]
     public void TheEpochIsTheClockInUnixMilliseconds()
     {
@@ -195,7 +197,7 @@ public class SequenceAllocatorTests
         Assert.Equal(new EpochDeclaration(StartMs, 1, 1), Counters(sequence.Declare()));
         Assert.Equal(new Slot(StartMs + 1, 1), sequence.Allocate());
         var rolled = sequence.Declaration();
-        Assert.Equal(new EpochDeclaration(StartMs, 1, 1), rolled.Previous);
+        Assert.Equal(new EpochDeclaration(StartMs, 1, 1), Strip(rolled.Previous!));
         Assert.Equal(new EpochDeclaration(StartMs + 1, 1, 0), Counters(rolled));
     }
 
@@ -215,7 +217,7 @@ public class SequenceAllocatorTests
         var sequence = Allocator();
         Assert.Equal(new EpochDeclaration(StartMs, 0, 0), Counters(sequence.Declare()));
         Assert.Equal(new Slot(StartMs + 1, 1), sequence.Allocate());
-        Assert.Equal(new EpochDeclaration(StartMs, 0, 0), sequence.Declaration().Previous);
+        Assert.Equal(new EpochDeclaration(StartMs, 0, 0), Strip(sequence.Declaration().Previous!));
     }
 
     [Fact]
@@ -287,5 +289,193 @@ public class SequenceAllocatorTests
                 Assert.True(slot.Number <= close, $"{slot} was allocated after epoch {slot.Epoch} closed at {close}");
             }
         }
+    }
+
+    // --- Epoch chain (ADR-0024 amendment, formal/wire-spec.md section 5) ---
+
+    private static void SealedEpoch(SequenceAllocator sequence)
+    {
+        sequence.NoteAttempt();
+        sequence.MarkExported(sequence.Allocate());
+        sequence.Declare();
+    }
+
+    [Fact]
+    public void C1AHookEntryCountsBeforeAllocationAndAllocateNeverCountsAgain()
+    {
+        var sequence = Allocator();
+        sequence.NoteAttempt();
+        sequence.Allocate();
+        Assert.Equal(1UL, sequence.Declaration().Attempted);
+        sequence.NoteAttempt();
+        sequence.NoteAttempt();
+        sequence.Allocate();
+        Assert.Equal(3UL, sequence.Declaration().Attempted);
+        Assert.Equal(2UL, sequence.Declaration().LastEmitted);
+    }
+
+    [Fact]
+    public void C1ALostAttemptShowsAttemptedAboveLastEmitted()
+    {
+        var sequence = Allocator();
+        sequence.NoteAttempt();
+        sequence.MarkExported(sequence.Allocate());
+        sequence.NoteAttempt(); // the hook entry fails before Allocate()
+        var declaration = sequence.Declaration();
+        Assert.Equal(2UL, declaration.Attempted);
+        Assert.Equal(1UL, declaration.LastEmitted);
+    }
+
+    [Fact]
+    public void C1ALostAttemptAcrossASealRollsAndCountsInTheNextEpochLeavingTheSealedOneExact()
+    {
+        var sequence = Allocator();
+        SealedEpoch(sequence);
+        sequence.NoteAttempt(); // sealed: rolls exactly as Allocate() would
+        var rolled = sequence.Declaration();
+        Assert.Equal(StartMs + 1, rolled.Epoch);
+        Assert.Equal(1UL, rolled.Attempted);
+        Assert.Equal(0UL, rolled.LastEmitted);
+        Assert.Equal(StartMs, rolled.PredecessorEpoch);
+        var closing = rolled.Previous!;
+        Assert.Equal(1UL, closing.Attempted);
+        Assert.Equal(closing.LastEmitted, closing.Attempted);
+    }
+
+    [Fact]
+    public void AnAllocationWithoutNoteAttemptNeverDeclaresAttemptedBelowLastEmitted()
+    {
+        var sequence = Allocator();
+        sequence.Allocate();
+        sequence.Allocate();
+        Assert.Equal(2UL, sequence.Declaration().Attempted);
+    }
+
+    [Fact]
+    public void C2SealedAtIsTheProducerClockAtTheFirstClosingDeclarationAndNeverMoves()
+    {
+        var sequence = Allocator();
+        sequence.NoteAttempt();
+        var slot = sequence.Allocate();
+        Assert.Null(sequence.Declare().SealedAtUnixNanoseconds);
+        sequence.MarkExported(slot);
+        _clock.SetUnixMilliseconds((long)StartMs + 5);
+        var sealedAt = sequence.Declare().SealedAtUnixNanoseconds;
+        Assert.Equal(((long)StartMs + 5) * 1_000_000L, sealedAt);
+        _clock.SetUnixMilliseconds((long)StartMs + 900);
+        Assert.Equal(sealedAt, sequence.Declare().SealedAtUnixNanoseconds);
+        Assert.Equal(sealedAt, sequence.Declaration().SealedAtUnixNanoseconds);
+    }
+
+    // C2 amended 2026-11-15: an epoch seals only when attempted == last_emitted.
+
+    [Fact]
+    public void C2AHeartbeatBetweenNoteAttemptAndAllocateDoesNotSeal()
+    {
+        var sequence = Allocator();
+        sequence.NoteAttempt();
+        var during = sequence.Declare();
+        Assert.Null(during.SealedAtUnixNanoseconds);
+        Assert.Equal((0UL, 0UL, 1UL), (during.LastEmitted, during.CompleteThrough, during.Attempted));
+        Assert.Equal(new Slot(StartMs, 1), sequence.Allocate());
+        Assert.Null(sequence.Declare().SealedAtUnixNanoseconds);
+    }
+
+    [Fact]
+    public void C2TheEpochStaysOpenWithCompleteThroughEqualLastWhileAttemptedIsAboveLast()
+    {
+        var sequence = Allocator();
+        sequence.NoteAttempt();
+        var first = sequence.Allocate();
+        sequence.NoteAttempt();
+        sequence.MarkExported(first);
+        var open = sequence.Declare();
+        Assert.Equal((1UL, 1UL, 2UL), (open.LastEmitted, open.CompleteThrough, open.Attempted));
+        Assert.Null(open.SealedAtUnixNanoseconds);
+        var second = sequence.Allocate();
+        Assert.Equal(new Slot(StartMs, 2), second);
+        sequence.MarkExported(second);
+        var closed = sequence.Declare();
+        Assert.NotNull(closed.SealedAtUnixNanoseconds);
+        Assert.Equal(closed.LastEmitted, closed.Attempted);
+    }
+
+    [Fact]
+    public void C2ALostAttemptKeepsTheEpochOpenSoASealedEpochNeverHasAttemptedAboveLast()
+    {
+        var sequence = Allocator();
+        sequence.NoteAttempt();
+        var slot = sequence.Allocate();
+        sequence.NoteAttempt();
+        sequence.MarkExported(slot);
+        for (var i = 0; i < 3; i++)
+        {
+            var d = sequence.Declare();
+            Assert.Null(d.SealedAtUnixNanoseconds);
+            Assert.True(d.Attempted > d.LastEmitted);
+        }
+    }
+
+    [Fact]
+    public void C2AnIdleEpochWithNoAttemptsStillSeals()
+    {
+        Assert.Equal((long)StartMs * 1_000_000L, Allocator().Declare().SealedAtUnixNanoseconds);
+    }
+
+    [Fact]
+    public void C2AndC7SealedAtNeverStepsBackwardsWhenTheClockDoes()
+    {
+        var sequence = Allocator();
+        SealedEpoch(sequence);
+        var sealedAt = sequence.Declaration().SealedAtUnixNanoseconds!.Value;
+        sequence.NoteAttempt();
+        var slot = sequence.Allocate();
+        _clock.SetUnixMilliseconds((long)StartMs - 10_000);
+        sequence.MarkExported(slot);
+        Assert.True(sequence.Declare().SealedAtUnixNanoseconds!.Value >= sealedAt);
+    }
+
+    [Fact]
+    public void C3ARollSetsThePredecessorAndKeepsTheClosingDeclarationUnchanged()
+    {
+        var sequence = Allocator();
+        SealedEpoch(sequence);
+        var closing = sequence.Declaration().CurrentEpoch();
+        sequence.NoteAttempt();
+        var slot = sequence.Allocate();
+        _clock.SetUnixMilliseconds((long)StartMs + 77);
+        var rolled = sequence.Declare();
+        Assert.Equal(StartMs, rolled.PredecessorEpoch);
+        Assert.Null(rolled.SealedAtUnixNanoseconds);
+        Assert.Equal(closing, rolled.Previous);
+        Assert.Null(closing.PredecessorEpoch);
+        sequence.MarkExported(slot);
+        sequence.Declare();
+        sequence.NoteAttempt();
+        var third = sequence.Declaration();
+        Assert.Equal(StartMs + 1, third.PredecessorEpoch);
+        Assert.Equal(StartMs + 1, third.Previous!.Epoch);
+        Assert.Equal(StartMs, third.Previous!.PredecessorEpoch);
+        Assert.NotNull(third.Previous!.SealedAtUnixNanoseconds);
+    }
+
+    [Fact]
+    public void C4RestartSetsThePredecessorOnlyWhenAPreviousEpochWasPersisted()
+    {
+        Assert.Equal(100UL, Allocator(previousEpoch: 100).Declaration().PredecessorEpoch);
+        Assert.Null(Allocator().Declaration().PredecessorEpoch);
+        Assert.Equal(100UL, Allocator(epoch: 200, previousEpoch: 100).Declaration().PredecessorEpoch);
+        Assert.Null(Allocator(epoch: 200).Declaration().PredecessorEpoch);
+        // attempted is not persisted: a restarted allocator starts at zero.
+        Assert.Equal(0UL, Allocator(previousEpoch: 100).Declaration().Attempted);
+    }
+
+    [Fact]
+    public void C1AnAttemptOnAnOverflowingRollIsASequenceException()
+    {
+        var rolled = Allocator(epoch: Max);
+        rolled.Declare();
+        Assert.Equal(SequenceException.SequenceOverflow, Assert.Throws<SequenceException>(() => rolled.NoteAttempt()).Code);
+        Assert.Equal(0UL, rolled.Declaration().Attempted);
     }
 }

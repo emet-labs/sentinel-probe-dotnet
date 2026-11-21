@@ -24,6 +24,7 @@ public class SequenceStampingProcessorTests
         Assert.True(SequenceStampingProcessor.TryGetSlot(activity, out var slot));
         Assert.Equal(new Slot(StartMs, 1), slot);
         Assert.Equal(0UL, _sequence.Declaration().CompleteThrough);
+        Assert.Equal(1UL, _sequence.Declaration().Attempted); // the hook entry was counted (C1)
     }
 
     [Fact]
@@ -35,6 +36,7 @@ public class SequenceStampingProcessorTests
         activity.SetTag(OtlpTraces.SequenceNumberKey, (long)reserved.Number);
         new SequenceStampingProcessor(_sequence).OnStart(activity);
         Assert.Equal(1UL, _sequence.HighestAllocated());
+        Assert.Equal(1UL, _sequence.Declaration().Attempted); // a host-stamped Activity is not a second hook entry
         Assert.True(SequenceStampingProcessor.TryGetSlot(activity, out var slot));
         Assert.Equal(reserved, slot);
     }

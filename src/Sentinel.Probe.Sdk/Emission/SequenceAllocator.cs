@@ -11,10 +11,23 @@ namespace Sentinel.Probe.Sdk.Emission;
 // contiguous prefix whose export succeeded. complete_through never passes a slot that is in
 // flight, failed or filtered, so missing evidence is never declared complete.
 //
-// A declared close (complete_through == last_emitted, returned by Declare()) seals the epoch:
-// Sentinel refuses any later slot in it. The next allocation therefore opens a new epoch,
-// max(epoch + 1, clock in Unix milliseconds). The roll is lazy, at allocation and never at the
-// heartbeat, so a quiet source keeps its epoch.
+// A declared close (complete_through == last_emitted and, since the C2 amendment of
+// 2026-11-15, attempted == last_emitted; returned by Declare()) seals the epoch:
+// Sentinel refuses any later slot in it. The next hook entry therefore opens a new epoch,
+// max(epoch + 1, clock in Unix milliseconds). The roll is lazy, at NoteAttempt() or Allocate()
+// and never at the heartbeat, so a quiet source keeps its epoch.
+//
+// Epoch chain (ADR-0024 amendment, formal/wire-spec.md section 5):
+//   - C1 NoteAttempt() is the first call on every hook entry. It rolls a sealed epoch exactly as
+//     Allocate() would, then counts the attempt, so a hook entry that fails before Allocate() is
+//     still visible as attempted > last_emitted. Allocate() never counts.
+//   - C2 the first declaration with complete_through == last_emitted records sealed_at from the
+//     producer clock inside the same critical section, and nothing moves it afterwards.
+//   - C3 a roll sets the new epoch's predecessor_epoch and keeps the closing declaration for
+//     re-send; the re-send is never edited.
+//   - C4 attempted is not persisted. The host-persisted previousEpoch, when given, is the first
+//     epoch's predecessor_epoch; without it the field is absent (unknown, not "first").
+//   - C6 one allocator per source identity at a time; the deployment must prevent two.
 //
 // Epochs and numbers are at most 2^63 - 1 (they travel as OTLP int64). Allocation past the
 // maximum is a SequenceException, never a wrap. One lock guards all state.
@@ -28,8 +41,24 @@ public readonly record struct Slot(ulong Epoch, ulong Number);
 /// </summary>
 public sealed record FilteredRange(ulong First, ulong Last, ulong FilterEpoch);
 
-/// <summary>The final declaration of one Sequence Epoch.</summary>
-public sealed record EpochDeclaration(ulong Epoch, ulong LastEmitted, ulong CompleteThrough);
+/// <summary>
+/// The declaration of one Sequence Epoch: its counters and the epoch-chain fields of the wire
+/// spec. A null <c>Attempted</c> is a legacy declaration, which the heartbeat sends with none of
+/// the four chain fields: absence is unknown, never zero.
+/// </summary>
+/// <param name="Epoch">The Sequence Epoch.</param>
+/// <param name="LastEmitted">The highest number allocated.</param>
+/// <param name="CompleteThrough">The contiguous prefix whose export succeeded.</param>
+/// <param name="Attempted">Hook entries of the epoch, counted before slot allocation (&gt;= LastEmitted).</param>
+/// <param name="SealedAtUnixNanoseconds">The producer instant of the first closing declaration; never moves.</param>
+/// <param name="PredecessorEpoch">The epoch this one followed, when the Probe knows it.</param>
+public sealed record EpochDeclaration(
+    ulong Epoch,
+    ulong LastEmitted,
+    ulong CompleteThrough,
+    ulong? Attempted = null,
+    long? SealedAtUnixNanoseconds = null,
+    ulong? PredecessorEpoch = null);
 
 /// <summary>
 /// What the heartbeat reports: the current epoch's counters, its filtered ranges (sorted, merged
@@ -40,7 +69,14 @@ public sealed record SequenceDeclaration(
     ulong LastEmitted,
     ulong CompleteThrough,
     IReadOnlyList<FilteredRange> Filtered,
-    EpochDeclaration? Previous);
+    EpochDeclaration? Previous,
+    ulong? Attempted = null,
+    long? SealedAtUnixNanoseconds = null,
+    ulong? PredecessorEpoch = null)
+{
+    /// <summary>The current epoch's declaration, chain fields included.</summary>
+    public EpochDeclaration CurrentEpoch() => new(Epoch, LastEmitted, CompleteThrough, Attempted, SealedAtUnixNanoseconds, PredecessorEpoch);
+}
 
 /// <summary>A refusal with a stable code shared with every Probe SDK and the sequence_completeness vectors.</summary>
 public sealed class SequenceException : Exception
@@ -84,6 +120,10 @@ public sealed class SequenceAllocator
     private ulong _last;
     private ulong _completeThrough;
     private bool _sealed;
+    private ulong _attempted;
+    private long? _sealedAt;
+    private ulong? _predecessor;
+    private long _lastClock = long.MinValue;
     private List<FilteredRange> _filtered = new();
     private EpochDeclaration? _previous;
 
@@ -111,28 +151,58 @@ public sealed class SequenceAllocator
                 $"epoch {epoch.Value} is not greater than the previous epoch {previousEpoch.Value}");
         }
         _epoch = epoch ?? (previousEpoch.HasValue ? Math.Max(ClockMilliseconds(), Successor(previousEpoch.Value)) : ClockMilliseconds());
+        _predecessor = previousEpoch;
     }
 
-    /// <summary>Returns the next slot. After a declared close it first opens a new epoch.</summary>
+    /// <summary>
+    /// Counts one hook entry (C1). Call it first on every hook entry, before any filtering,
+    /// serialization or <see cref="Allocate"/>. After a declared close it opens the next epoch,
+    /// exactly as Allocate would. It throws SequenceException only on overflow, like Allocate.
+    /// </summary>
+    public void NoteAttempt()
+    {
+        lock (_lock)
+        {
+            RollIfSealed();
+            _attempted = Successor(_attempted);
+        }
+    }
+
+    /// <summary>Returns the next slot. After a declared close it first opens a new epoch. It never counts an attempt.</summary>
     public Slot Allocate()
     {
         lock (_lock)
         {
-            if (_sealed)
-            {
-                var opened = Math.Max(Successor(_epoch), ClockMilliseconds());
-                _previous = new EpochDeclaration(_epoch, _last, _completeThrough);
-                _epoch = opened;
-                _last = 0;
-                _completeThrough = 0;
-                _states.Clear();
-                _filtered = new List<FilteredRange>();
-                _sealed = false;
-            }
+            RollIfSealed();
             _last = Successor(_last);
+            // A host that skipped NoteAttempt still cannot declare attempted < last_emitted.
+            if (_attempted < _last)
+            {
+                _attempted = _last;
+            }
             _states[_last] = SlotState.InFlight;
             return new Slot(_epoch, _last);
         }
+    }
+
+    // Opens the next epoch after a declared close (C3). The caller holds the lock.
+    private void RollIfSealed()
+    {
+        if (!_sealed)
+        {
+            return;
+        }
+        var opened = Math.Max(Successor(_epoch), ClockMilliseconds());
+        _previous = new EpochDeclaration(_epoch, _last, _completeThrough, _attempted, _sealedAt, _predecessor);
+        _predecessor = _epoch;
+        _epoch = opened;
+        _last = 0;
+        _completeThrough = 0;
+        _attempted = 0;
+        _sealedAt = null;
+        _states.Clear();
+        _filtered = new List<FilteredRange>();
+        _sealed = false;
     }
 
     /// <summary>
@@ -214,15 +284,21 @@ public sealed class SequenceAllocator
     {
         lock (_lock)
         {
-            if (_completeThrough == _last)
+            // C2 (amended): seal only when attempted == last_emitted, so a heartbeat between
+            // NoteAttempt and Allocate of one hook entry leaves the epoch open.
+            if (_completeThrough == _last && _attempted == _last)
             {
+                if (!_sealed)
+                {
+                    _sealedAt = ProducerNow();
+                }
                 _sealed = true;
             }
             return Snapshot();
         }
     }
 
-    private SequenceDeclaration Snapshot() => new(_epoch, _last, _completeThrough, _filtered, _previous);
+    private SequenceDeclaration Snapshot() => new(_epoch, _last, _completeThrough, _filtered, _previous, _attempted, _sealedAt, _predecessor);
 
     // False for a slot of another epoch, a number never allocated, or a number at or below
     // complete_through (EXPORTED, already discarded).
@@ -230,6 +306,15 @@ public sealed class SequenceAllocator
     {
         state = default;
         return slot.Epoch == _epoch && slot.Number >= 1 && slot.Number <= _last && _states.TryGetValue(slot.Number, out state);
+    }
+
+    // The producer clock for sealed_at (C2, C7), in Unix nanoseconds. It never steps backwards
+    // within this allocator.
+    private long ProducerNow()
+    {
+        var ticks = _timeProvider.GetUtcNow().UtcTicks - DateTimeOffset.UnixEpoch.UtcTicks;
+        _lastClock = Math.Max(_lastClock, checked(ticks * 100));
+        return _lastClock;
     }
 
     private ulong ClockMilliseconds()

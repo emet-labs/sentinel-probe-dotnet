@@ -230,14 +230,14 @@ public sealed class CompletenessHeartbeat : IDisposable
         }
         var declaration = _sequence.Declare();
         var ack = _filterEpoch() ?? 0;
-        var moment = AdvanceClock(declaration.Epoch, declaration.LastEmitted);
+        var moment = AdvanceClock(declaration);
         var previous = declaration.Previous;
         if (previous != null
             && _lastAccepted?.Declaration.Epoch != declaration.Epoch
             && _lastAccepted != new Accepted(previous, ack)
             && ack >= FloorOf(previous.Epoch))
         {
-            await SendOneAsync(previous, ack, moment, reports, cancellationToken).ConfigureAwait(false);
+            await SendOneAsync(previous, ack, moment, reports, cancellationToken, superseded: true).ConfigureAwait(false);
         }
         var floor = FloorOf(declaration.Epoch);
         if (ack < floor)
@@ -248,7 +248,7 @@ public sealed class CompletenessHeartbeat : IDisposable
                 $"acknowledged Filter epoch {ack} is below {floor} already sent for epoch {declaration.Epoch}"));
             return reports;
         }
-        var current = new EpochDeclaration(declaration.Epoch, declaration.LastEmitted, declaration.CompleteThrough);
+        var current = declaration.CurrentEpoch();
         await SendOneAsync(current, ack, moment, reports, cancellationToken).ConfigureAwait(false);
         var oldest = previous?.Epoch ?? declaration.Epoch;
         foreach (var epoch in new List<ulong>(_ackFloor.Keys))
@@ -263,11 +263,16 @@ public sealed class CompletenessHeartbeat : IDisposable
 
     // The report instant never goes before an earlier report or the activity change; an
     // allocation since an idle declaration ends it.
-    private Moment AdvanceClock(ulong epoch, ulong lastEmitted)
+    private Moment AdvanceClock(SequenceDeclaration declaration)
     {
+        var epoch = declaration.Epoch;
+        var lastEmitted = declaration.LastEmitted;
+        // C7: no row is reported before an epoch it declares was sealed, even if the allocator's
+        // clock and the heartbeat's differ.
+        var sealedFloor = Math.Max(declaration.SealedAtUnixNanoseconds ?? 0, declaration.Previous?.SealedAtUnixNanoseconds ?? 0);
         lock (_stateLock)
         {
-            var now = Math.Max(Math.Max(NowUnixNanoseconds(), _lastReportedAt), _activitySince);
+            var now = Math.Max(Math.Max(Math.Max(NowUnixNanoseconds(), _lastReportedAt), _activitySince), sealedFloor);
             _lastReportedAt = now;
             if (_activity == SourceActivityState.IntentionallyIdle && _idleMark != (epoch, lastEmitted))
             {
@@ -283,13 +288,14 @@ public sealed class CompletenessHeartbeat : IDisposable
         ulong ack,
         Moment moment,
         List<CompletenessReport> reports,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool superseded = false)
     {
         if (_stopped)
         {
             return;
         }
-        var signal = CompletenessSignals.Build(declaration, ack, moment.Activity, moment.ReportedAt, moment.ActivitySince);
+        var signal = CompletenessSignals.Build(declaration, ack, moment.Activity, moment.ReportedAt, moment.ActivitySince, superseded);
         _ackFloor[declaration.Epoch] = Math.Max(FloorOf(declaration.Epoch), ack);
         bool accepted;
         try

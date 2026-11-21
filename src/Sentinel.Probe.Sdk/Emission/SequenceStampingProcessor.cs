@@ -39,6 +39,10 @@ public sealed class SequenceStampingProcessor : BaseProcessor<Activity>
         Slot slot;
         try
         {
+            // C1: count the hook entry first, so an entry that fails before Allocate() is still
+            // visible as attempted > last_emitted. Limit: an Activity the host's sampler drops
+            // never reaches this hook, so it is invisible to attempted.
+            _sequence.NoteAttempt();
             slot = _sequence.Allocate();
         }
         catch (SequenceException)

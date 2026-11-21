@@ -310,6 +310,27 @@ public class ConformanceVectorsTests
         Assert.Equal(BigInteger.Parse(want.GetProperty("occurrence_ns").GetString()!), Int128Codec.ToBigInteger(signal.ProducerReportedAt.Nanoseconds));
         Assert.Equal(ulong.Parse(want.GetProperty("uncertainty_nanoseconds").GetString()!), signal.ProducerReportedAt.UncertaintyNanoseconds);
         Assert.Equal(Activity(want.GetProperty("activity").GetString()!), signal.Activity);
+        // A key the case omits must be absent from the wire (the legacy encoding).
+        Assert.Equal(want.TryGetProperty("predecessor_epoch", out var predecessor), signal.HasPredecessorEpoch);
+        if (predecessor.ValueKind == JsonValueKind.String)
+        {
+            Assert.Equal(ulong.Parse(predecessor.GetString()!), signal.PredecessorEpoch);
+        }
+        Assert.Equal(want.TryGetProperty("attempted", out var attempted), signal.HasAttempted);
+        if (attempted.ValueKind == JsonValueKind.String)
+        {
+            Assert.Equal(ulong.Parse(attempted.GetString()!), signal.Attempted);
+        }
+        Assert.Equal(want.TryGetProperty("superseded", out var superseded), signal.HasSuperseded);
+        if (superseded.ValueKind != JsonValueKind.Undefined)
+        {
+            Assert.Equal(superseded.GetBoolean(), signal.Superseded);
+        }
+        Assert.Equal(want.TryGetProperty("sealed_at_ns", out var sealedAt), signal.SealedAt is not null);
+        if (sealedAt.ValueKind == JsonValueKind.String)
+        {
+            Assert.Equal(BigInteger.Parse(sealedAt.GetString()!), Int128Codec.ToBigInteger(signal.SealedAt!.Nanoseconds));
+        }
     }
 
     private static void AssertVerdict(JsonElement vector, byte[] bytes)

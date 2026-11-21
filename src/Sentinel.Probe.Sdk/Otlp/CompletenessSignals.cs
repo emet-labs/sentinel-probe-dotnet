@@ -20,10 +20,11 @@ public static class CompletenessSignals
         ulong acknowledgedFilterEpoch,
         SourceActivityState activity,
         long reportedAtUnixNanoseconds,
-        long activitySinceUnixNanoseconds)
+        long activitySinceUnixNanoseconds,
+        bool superseded = false)
     {
         System.ArgumentNullException.ThrowIfNull(declaration);
-        return new ProducerCompletenessSignal
+        var signal = new ProducerCompletenessSignal
         {
             SequenceEpoch = declaration.Epoch,
             LastEmitted = declaration.LastEmitted,
@@ -33,6 +34,25 @@ public static class CompletenessSignals
             Activity = activity,
             ActivitySince = UnixTime(activitySinceUnixNanoseconds),
         };
+        // The four epoch-chain fields (ADR-0024 amendment). A declaration without Attempted is
+        // legacy: none of them is sent, and Sentinel reads the row as lacking an epoch chain.
+        if (declaration.Attempted is { } attempted)
+        {
+            signal.Attempted = attempted;
+            if (declaration.PredecessorEpoch is { } predecessor)
+            {
+                signal.PredecessorEpoch = predecessor;
+            }
+            if (declaration.SealedAtUnixNanoseconds is { } sealedAt)
+            {
+                signal.SealedAt = UnixTime(sealedAt);
+            }
+            if (superseded)
+            {
+                signal.Superseded = true;
+            }
+        }
+        return signal;
     }
 
     private static OccurrenceTime UnixTime(long nanoseconds) => new()

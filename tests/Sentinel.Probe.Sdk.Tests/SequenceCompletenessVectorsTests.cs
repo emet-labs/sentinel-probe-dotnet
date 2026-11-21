@@ -108,6 +108,18 @@ public class SequenceCompletenessVectorsTests
                 case "allocate":
                     Allocate(where, step);
                     break;
+                case "allocate_pending":
+                {
+                    // The Allocate half of a hook entry an earlier "attempt" step already counted.
+                    var expect = step.GetProperty("expect");
+                    var want = new Slot(Uint(expect.GetProperty("epoch"))!.Value, Uint(expect.GetProperty("number"))!.Value);
+                    Assert.True(want == _sequence.Allocate(), where);
+                    break;
+                }
+                case "attempt":
+                    // A hook entry that fails before allocation: counted (C1), no slot.
+                    _sequence.NoteAttempt();
+                    break;
                 case "export_ok":
                     _sequence.MarkExported(SlotOf(step));
                     break;
@@ -148,12 +160,19 @@ public class SequenceCompletenessVectorsTests
         {
             if (step.TryGetProperty("expect_error", out var code))
             {
-                Assert.Equal(code.GetString(), Assert.Throws<SequenceException>(() => _sequence.Allocate()).Code);
+                Assert.Equal(code.GetString(), Assert.Throws<SequenceException>(() => HookEntry()).Code);
                 return;
             }
             var expect = step.GetProperty("expect");
             var want = new Slot(Uint(expect.GetProperty("epoch"))!.Value, Uint(expect.GetProperty("number"))!.Value);
-            Assert.True(want == _sequence.Allocate(), where);
+            Assert.True(want == HookEntry(), where);
+        }
+
+        // What the span path does: NoteAttempt first (C1), then Allocate.
+        private Slot HookEntry()
+        {
+            _sequence.NoteAttempt();
+            return _sequence.Allocate();
         }
 
         private async Task ReportAsync(string where, JsonElement step, Func<Task<IReadOnlyList<CompletenessReport>>> call)
@@ -217,8 +236,49 @@ public class SequenceCompletenessVectorsTests
                 Assert.True(time.UncertaintyNanoseconds == 0, $"{where} {key} uncertainty");
                 Assert.True(BigInteger.Parse(want.GetProperty(key).GetString()!, System.Globalization.CultureInfo.InvariantCulture) == Int128Codec.ToBigInteger(time.Nanoseconds), $"{where} {key}");
             }
+            AssertChain(where, decoded, want);
             Assert.True(want.GetProperty("restates_previous").GetBoolean() == Restates(signal), where + " restates_previous");
             _previous = signal;
+        }
+
+        // The four epoch-chain fields (wire spec section 1). A key the vector omits is not
+        // asserted; a null value asserts the field is absent from the wire.
+        private static void AssertChain(string where, ProducerCompletenessSignal decoded, JsonElement want)
+        {
+            void Check(string key, bool present, Func<string> actual)
+            {
+                if (!want.TryGetProperty(key, out var expected))
+                {
+                    return;
+                }
+                Assert.True((expected.ValueKind != JsonValueKind.Null) == present, $"{where} {key} presence");
+                if (expected.ValueKind != JsonValueKind.Null)
+                {
+                    var text = expected.ValueKind == JsonValueKind.True ? "true" : expected.GetString();
+                    Assert.True(text == actual(), $"{where} {key}");
+                }
+            }
+
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            Check("attempted", decoded.HasAttempted, () => decoded.Attempted.ToString(ci));
+            Check("predecessor_epoch", decoded.HasPredecessorEpoch, () => decoded.PredecessorEpoch.ToString(ci));
+            Check("sealed_at_ns", decoded.SealedAt != null, () => Int128Codec.ToBigInteger(decoded.SealedAt!.Nanoseconds).ToString(ci));
+            // superseded: false means absent (or false) on the wire.
+            if (want.TryGetProperty("superseded", out var superseded))
+            {
+                Assert.True((superseded.ValueKind == JsonValueKind.True) == (decoded.HasSuperseded && decoded.Superseded), $"{where} superseded");
+            }
+            if (decoded.SealedAt != null)
+            {
+                Assert.True(decoded.SealedAt.ClockDomainId == "unix", $"{where} sealed_at clock domain");
+                Assert.True(
+                    Int128Codec.ToBigInteger(decoded.SealedAt.Nanoseconds) <= Int128Codec.ToBigInteger(decoded.ProducerReportedAt.Nanoseconds),
+                    $"{where} sealed_at is not after the row's report");
+            }
+            if (decoded.HasAttempted)
+            {
+                Assert.True(decoded.Attempted >= decoded.LastEmitted, $"{where} attempted >= last_emitted");
+            }
         }
 
         // The signal, re-encoded with the previous signal's report nanoseconds, is byte-identical
