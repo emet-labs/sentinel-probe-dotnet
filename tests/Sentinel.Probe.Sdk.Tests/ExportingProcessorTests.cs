@@ -614,17 +614,35 @@ public class ExportingProcessorTests
     public async Task a_rejected_batch_is_resent_one_by_one_so_a_refusal_fails_only_its_event()
     {
         var refusal = Refusal("append_events conflicted: evidence_conflict");
-        // Request 1 is the batch of three (rejected as a whole); then one request per Event.
-        var handler = new Handler((_, n) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+        var gate = new TaskCompletionSource();
+        var entered = new TaskCompletionSource();
+        // Request 1 is a primer Event that parks the worker, so the three Events under test are all
+        // queued before its next drain and leave as exactly one batch (no dependence on scheduling).
+        // Request 2 is that batch of three (rejected as a whole); then one request per Event:
+        // request 3 accepted, request 4 refused (duplicate Event id), request 5 accepted.
+        var handler = new Handler(async (_, n) =>
         {
-            Content = new ByteArrayContent(n == 1 || n == 3 ? refusal : Array.Empty<byte>()),
-        }));
+            if (n == 1)
+            {
+                entered.TrySetResult();
+                await gate.Task;
+            }
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(n == 2 || n == 4 ? refusal : Array.Empty<byte>()),
+            };
+        });
         using var rig = new Rig(handler, maxBatch: 8);
-        for (var i = 0; i < 3; i++) rig.Emit();
+        rig.Emit();                       // slot 1: the primer, held in the transport
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        for (var i = 0; i < 3; i++) rig.Emit(); // slots 2-4: queued together behind the parked worker
+        gate.SetResult();
         await rig.Processor.ShutdownAsync();
-        Assert.Equal(4, handler.Calls);
+        Assert.Equal(new[] { 1, 3, 1, 1, 1 }, handler.Requests.Select(r => SpanCount(r.Body)).ToArray());
+        Assert.Equal(5, handler.Calls);
         Assert.Equal(ExportFailureKind.DuplicateEventId, rig.Failures.Single().Kind);
-        Assert.Equal((3UL, 1UL), (rig.Declaration.LastEmitted, rig.Declaration.CompleteThrough));
+        // Slots 1 and 2 exported, slot 3 failed, slot 4 exported but past the boundary.
+        Assert.Equal((4UL, 2UL), (rig.Declaration.LastEmitted, rig.Declaration.CompleteThrough));
     }
 
     [Fact]
