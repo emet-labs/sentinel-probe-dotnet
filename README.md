@@ -1,213 +1,299 @@
-# .NET Probe SDK
+# .NET Probe SDK for Sentinel
 
-The .NET Probe SDK (issue #30), ported module-for-module from the Go reference SDK
-(`sdk/go/`, issue #33). It implements against the locked proto contract (#27, closed).
+[![CI](https://github.com/emet-labs/sentinel-probe-dotnet/actions/workflows/ci.yml/badge.svg)](https://github.com/emet-labs/sentinel-probe-dotnet/actions/workflows/ci.yml)
+[![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-informational.svg)](LICENSE)
 
-The SDK:
+The .NET Probe SDK for [Sentinel](https://github.com/emet-labs) — instrument a .NET
+application as a Sentinel **Probe**: the in-process component that reports what your application
+really did, as Events, and receives Sentinel's Verdicts and Event Filters in return.
 
-- connects to Sentinel and holds the versioned Event Filter for its source (`Client/`)
-- wraps the OpenTelemetry .NET SDK to produce `Activity` spans the OTLP Adapter
-  normalizes (`Emission/`)
-- applies attribute-level Filter projection before shipping — relevance, never
-  sampling (`Filter/`, ADR-0006)
-- exports ended spans and producer completeness as OTLP/HTTP protobuf, and
-  receives Verdict, EventFilter, and DecideResponse (`Otlp/`, loopback by default and bindable;
-  the #398 Probe-wire exception). The gate waits on that log for at most the
-  request's remaining Transport Budget, then applies its fail mode. Connect is not
-  the live path.
-- reads source-tier from deployment config (`Config/`, ADR-0022, never hard-coded)
+Sentinel verifies cross-system action sequences against Specifications you declare, using
+recorded evidence rather than logs and dashboards. A Probe is how your code joins that
+contract. Missing evidence is never a pass: until Sentinel can show it has seen everything
+a source emitted, a Verdict that depends on that source stays Inconclusive.
 
-## OTLP wire
+## Requirements
 
-`OtlpExporter` posts `ExportTraceServiceRequest` bytes to `/v1/traces` and a
-`ProducerCompletenessSignal` log to `/v1/logs`, with `x-sentinel-source-handle`.
-A missing predecessor id fails that export. `OtlpLogReceiver` serves `POST /v1/logs`; it binds
-`127.0.0.1` on a random port by default, and `OtlpLogReceiver.Start("0.0.0.0", 9300)` (or
-`Start(IPAddress, port)`) lets a containerised Probe receive Event Filters.
-`Start(TimeProvider)` and `Start(IPAddress, port, TimeProvider)` take the clock that times each
-decision wait, so a test can expire one without a wall clock. A wait lasts at most the request's
-remaining Transport Budget, floored to whole 100 ns ticks and capped at the `Timer` limit
-(`uint.MaxValue - 1` ms, about 49.7 days). Below 100 ns no timer is armed and the wait fails at
-once. On `TimeProvider.System` the timer counts whole milliseconds, so a budget below 1 ms arms a
-0 ms timer that fires at once, close to TypeScript and Elixir, which fail without arming (#536).
-`new OtlpExporter(url, http, resourceAttributes)` sends OTLP **resource** attributes (`service.name`
-and the provenance keys of `platform/probe-config`) with every trace export. They are never span
-attributes, so the eight-key span contract is unchanged. A non-2xx answer throws an
-`OtlpExportException` whose message, `StatusCode` and `ResponseBody` carry Sentinel's reply, and
-whose `IsTransient` is true for no response, timeout, and HTTP 408, 425, 429, 500, 502, 503 and 504. `harness-probe-sdk-dotnet` builds `sentinel-periphery`
-and runs the sample CAT-1 charge/ship round trip against it.
+- .NET 10 SDK.
+- A [Sentinel](https://github.com/emet-labs) deployment on the same host as the Probe.
+  The receiver uses the IPv4 loopback address `127.0.0.1`. Start it before Sentinel,
+  following the order below.
+
+## Installation
+
+The package is not yet on NuGet. Until it is, build it from this repository:
+
+```sh
+dotnet restore --locked-mode Sentinel.Probe.Sdk.sln
+dotnet build --no-restore Sentinel.Probe.Sdk.sln
+```
+
+The generated protobuf types are committed, so a bare clone builds with no code
+generator, and the committed `packages.lock.json` files make restores reproducible.
+
+## Quickstart
+
+The Probe wire is OTLP/HTTP protobuf, in both directions:
+
+- each ended `Activity` is exported as one Event to Sentinel's `POST /v1/traces`, with the
+  `x-sentinel-source-handle` header naming your source;
+- completeness signals go to `POST /v1/logs` on the same base URL, with the same
+  `x-sentinel-source-handle` header;
+- Sentinel posts Verdicts and published Event Filters as OTLP logs to the Probe's loopback
+  log receiver.
+
+Start the Probe and its log receiver first. Then start Sentinel with
+`SENTINEL_PROBE_LOG_URL` set to the receiver's full `http://127.0.0.1:<port>/v1/logs`
+URL, and publish the Specification only after the receiver is listening. Sentinel reads
+this URL once at startup and does not retry a failed Filter push. If the receiver's port
+changes when the Probe restarts, restart Sentinel with the new URL and publish again.
+One Sentinel process has one Probe log URL, so only one Probe process receives these
+Verdicts and Event Filters today.
+
+Both ingest routes require a source handle admitted by your Sentinel deployment; replace
+`checkout-service` below with that handle. A missing header returns HTTP 401; an unknown
+handle returns HTTP 403, and neither stores evidence. A completeness record's
+`sentinel.source_handle` must match the header; the SDK exporter sets both.
+
+Sentinel accepts `Content-Type: application/x-protobuf`, with identity or gzip encoding.
+OTLP/JSON, OTLP/gRPC and other encodings are unsupported (HTTP 415 on the HTTP route).
+An invalid span can refuse the whole request during decoding, including an unknown
+`sentinel.*` attribute. Admission conflicts may instead return HTTP 200 with nonzero
+`partial_success.rejected_spans`; this is still a failed export for completeness.
+The OTel span name becomes the Event kind.
+
+```csharp
+using Emet.Sentinel.Model.V1;
+using OpenTelemetry.Trace;
+using Sentinel.Probe.Sdk.Client;
+using Sentinel.Probe.Sdk.Emission;
+using Sentinel.Probe.Sdk.Otlp;
+
+const string SentinelUrl = "http://127.0.0.1:8080";
+const string SourceHandle = "checkout-service";
+
+// The loopback log receiver: point Sentinel's SENTINEL_PROBE_LOG_URL at receiver.LogsUrl.
+using var receiver = OtlpLogReceiver.Start();
+
+// The versioned Event Filter for this source.
+var store = new FilterStore();
+
+// One sequence allocator per source. The stamping processor numbers each Activity when
+// it starts (see "Sequence numbers and completeness").
+var sequence = new SequenceAllocator();
+using var tracer = ProbeTracer.NewProbeTracer(new ProbeTracerOptions
+{
+    TracerName = SourceHandle,
+    ServiceName = SourceHandle,
+    ConfigureProvider = builder => builder.AddProcessor(new SequenceStampingProcessor(sequence)),
+});
+using var exporter = new OtlpExporter(SentinelUrl);
+
+// Declares this source's completeness on POST /v1/logs.
+using var heartbeat = new CompletenessHeartbeat(
+    sequence,
+    (signal, ct) => exporter.ExportCompletenessAsync(SourceHandle, signal, ct),
+    filterEpoch: store.Epoch,
+    onError: error => Console.Error.WriteLine(error));
+heartbeat.Start();
+
+// Repeat whenever a new Filter arrives, before emitting or reporting completeness.
+if (receiver.Filters.Count > 0) store.Set(receiver.Filters[^1]);
+
+var activity = tracer.Source.StartActivity("checkout.charge.completed")!;
+activity.SetTag("order.id", "order-1001");
+// ... the work the Specification watches ...
+activity.Stop();
+
+// This SDK has no exporting processor: export the ended Activity and mark its slot.
+if (SequenceStampingProcessor.TryGetSlot(activity, out var slot))
+{
+    try
+    {
+        long rejected = await exporter.ExportSpansCheckedAsync(SourceHandle, new[]
+        {
+            new SpanExport
+            {
+                Activity = activity,
+                EventId = Guid.NewGuid().ToString(),
+                SequenceEpoch = slot.Epoch,
+                SequenceNumber = slot.Number,
+                SchemaVersion = "1.0.0",
+                AcknowledgedFilterEpoch = store.Epoch() ?? 0UL,
+                ClaimedSensitivity = Sensitivity.SensitivityInternal,
+            },
+        }, CancellationToken.None);
+        if (rejected == 0) sequence.MarkExported(slot); else sequence.MarkFailed(slot);
+    }
+    catch (OtlpExportException)
+    {
+        sequence.MarkFailed(slot);
+    }
+}
+
+// On a clean exit, once the exports have settled: send the final completeness report.
+await heartbeat.ShutdownAsync();
+```
+
+`SpanExport` supplies the Event contract for one ended `Activity`: `EventId`,
+`SchemaVersion`, `AcknowledgedFilterEpoch` (0 until the first Event Filter arrives),
+`ClaimedSensitivity` (anything but unspecified) and the two sequence numbers. A causal
+predecessor goes in the `sentinel.parent.event.id` tag, or in a link's own
+`sentinel.event.id` tag. An `Activity` that breaks this contract, or an export Sentinel
+refuses, throws `OtlpExportException`, and nothing is sent for a refused `Activity`. A
+span id never stands in for a missing Event id.
+
+Event Filters collect in `receiver.Filters` (oldest first) and are not applied for you.
+Hand the newest to `store.Set`, which is a no-op for an unchanged or older epoch. No export
+path in this SDK applies the Event Filter; `ApplyFilter.Apply` projects a `ProducerEvent`
+against the held Filter.
+
+Start Probe spans as roots, or stamp the parent's Event id in
+`sentinel.parent.event.id`: an ambient OTel parent without that Event id is refused.
+
+### Enforcement gate
+
+The gate is in the SDK, but Sentinel does not answer decision requests yet (see Status).
+
+```csharp
+using Sentinel.Probe.Sdk.Enforcement;
+using Sentinel.Probe.Sdk.Filter;
+using Sentinel.Probe.Sdk.Ids;
+
+// `projected` is the ProducerEvent for the action: tracer.ToEvent(...), then
+// ApplyFilter.Apply against store.Get(). The receiver waits for a DecideResponse for at most
+// the request's remaining Transport Budget, then the gate applies its fail mode.
+GateOutcome outcome = await Gate.GateAsync(
+    projected,
+    store.Get(),
+    deadlineNs: null, // an absolute monotonic deadline, if you set one
+    new Deps
+    {
+        Decide = Gate.FromLogReceiver(receiver),
+        NowMonotonicNs = MonotonicNanos,        // your monotonic clock, in nanoseconds
+        AcceptedFailModeFor = AcceptedFailMode, // the fail mode your deployment contracted
+    },
+    new Options
+    {
+        SourceHandle = SourceHandle,
+        RequestId = ProbeIds.GenerateRequestId(),
+        IdempotencyKey = ProbeIds.GenerateIdempotencyKey(),
+    },
+    CancellationToken.None); // cancel early only if the host gives up before the budget
+
+if (outcome.Kind.Permitted()) CommitTheAction(); // Permit, FailOpenPermit or NoFilter
+else Rollback();                                 // Deny, Defer or FailClosedDeny
+```
+
+## What the Probe does
+
+| Namespace | Duty |
+|---|---|
+| `Sentinel.Probe.Sdk.Otlp` | The Probe wire. `OtlpExporter` posts ended Activities to `POST /v1/traces` and completeness signals to `POST /v1/logs`; `OtlpLogReceiver` is the loopback log receiver for Verdicts, Event Filters and DecideResponses; `CompletenessHeartbeat` reports completeness |
+| `Sentinel.Probe.Sdk.Emission` | OTel `Activity` spans become Events (`ProbeTracer`, `SpanToEventConverter`). `SequenceAllocator` and `SequenceStampingProcessor` number the Events |
+| `Sentinel.Probe.Sdk.Client` | Holds the versioned Event Filter for your source (`FilterStore`) |
+| `Sentinel.Probe.Sdk.Filter` | Relevance projection — drops attributes no Specification needs. Never samples (`ApplyFilter`) |
+| `Sentinel.Probe.Sdk.Enforcement` | The blocking decision — permit / deny / defer, with per-Specification fail modes and a monotonic latency budget (`Gate`, `Gate.FromLogReceiver`). Not answered yet: see Status |
+| `Sentinel.Probe.Sdk.Config` | Source Tier resolution from deployment config, never hard-coded (`SourceTierLoader`) |
 
 ## Sequence numbers and completeness
 
-Create one `Emission.SequenceAllocator` per source and add
-`new SequenceStampingProcessor(sequence)` to the host's TracerProvider. It allocates
-at Activity start and stamps `sentinel.sequence.epoch` and `sentinel.sequence.number`;
-an Activity already carrying both keeps its reserved slot. Add `OtlpExportingSpanProcessor` after it: it reads the slot, builds the `SpanExport`, queues it and
-marks the slot (below). A host may still call `OtlpExporter.ExportSpansCheckedAsync` itself: mark the
-slot exported only on HTTP 2xx with zero `partial_success.rejected_spans`; on a refusal, error or
-undecodable response use `sequence.MarkFailed(slot)`. A host Filter drop uses `MarkFiltered(slot, filterEpoch)`.
+To show it has seen everything a source emitted, Sentinel needs two things from the
+source:
 
-## Exporting processor
+- **Sequence numbers.** Every exported Event carries `sentinel.sequence.epoch`, its
+  Sequence Epoch, and `sentinel.sequence.number`: 1, 2, 3, … within that epoch.
+- **Completeness signals.** A `ProducerCompletenessSignal` on `POST /v1/logs` declares, for
+  the current epoch, `last_emitted` (the highest number allocated) and `complete_through`
+  (the highest number up to which every Event was exported successfully), with the Filter
+  epoch the Probe acknowledges. The source's Watermark advances from these signals.
 
-```csharp
-var processor = new OtlpExportingSpanProcessor(new OtlpExportingSpanProcessorOptions
-{
-    SourceHandle = handle, Sequence = sequence, Exporter = exporter, SchemaVersion = "my-schema-v1",
-    Filters = filterStore,
-    AllowUnattributedRemoteParent = true,
-    OnError = f => metrics.Increment(f.Kind.ToString()),
-    Log = Console.Error.WriteLine,
-});
-builder.AddProcessor(new SequenceStampingProcessor(sequence)).AddProcessor(processor);
-// shutdown: dispose the provider, then flush and send the final declaration, in that order
-await processor.ShutdownAsync(heartbeat, ct);
-```
+The SDK provides both:
 
-- **Never throws from the span-end path.** A conversion, validation, encode or transport error is
-  caught: the slot is marked FAILED (`complete_through` never advances past it), the error goes to
-  `OnError` (an `ExportFailure` with kind, error and slots) and to a rate-limited `Log`
-  (`LogInterval`, default 10 s). An `OnError` or `Log` that throws is swallowed. A span with no slot is ignored.
-- **Bounded async queue.** One worker exports batches (`MaxBatch` 32). When the queue
-  (`QueueCapacity` 4096) is full the **newest** Event is dropped, its slot is FAILED and
-  `DroppedCount` rises: a dropped Event is missing evidence, never a pass.
-- **Retries.** The Probe SDK retry policy ([`../README.md`](../README.md)): transport errors (no
-  response, timeout) and HTTP 408, 425, 429, 500, 502, 503 and 504 are retried with exponential
-  backoff and jitter (`RetryBaseDelay` 100 ms, capped at `RetryMaxDelay` 5 s, a `Retry-After` on a
-  429 or 503 honored within the cap) up to `MaxAttempts` (5), then FAILED.
-  Validation errors, every other status and `rejected_spans` are deterministic: FAILED at once, not
-  retried. Each Event is validated alone first, so one bad span does not fail its batch, and a
-  batch Sentinel rejects is resent one Event at a time so a refusal fails only the Event it names.
-- **Duplicate Event id.** When Sentinel refuses a second delivery of an Event id it holds
-  (`evidence_conflict`, `identity_conflict`), `OnError` receives `ExportFailureKind.DuplicateEventId`
-  (reason `duplicate-event-id`), the slot stays FAILED, `complete_through` never passes it and
-  nothing is retried: the slot number never reached Sentinel as an Event, so completeness through it
-  would be overstated. Any other rejection (`slot_conflict`) also stays FAILED.
-- **Shutdown.** `ShutdownAsync(heartbeat)` stops intake, waits until every queued Event is exported
-  or FAILED, then sends the heartbeat's final declaration. `Dispose` only stops intake.
+- `Sentinel.Probe.Sdk.Emission.SequenceAllocator`: create one per source.
+  `SequenceStampingProcessor` allocates a slot when each `Activity` starts and stamps both
+  sequence tags; `SequenceStampingProcessor.TryGetSlot` reads the slot back. An `Activity`
+  that already carries both keeps them, so you can reserve a slot with `Allocate()` ahead
+  of its Event and stamp it yourself.
+- This SDK has no exporting processor, so your code marks each slot, as the quickstart
+  shows. An export succeeded only when Sentinel answered HTTP 2xx with no rejected spans
+  (`partial_success.rejected_spans` absent or 0): `ExportSpansCheckedAsync` returns that
+  count and throws on any other status. Mark the slot with `MarkExported` on success and
+  `MarkFailed` otherwise. If you drop an Event for the Event Filter, mark its slot with
+  `MarkFiltered(slot, filterEpoch)`.
+- `Sentinel.Probe.Sdk.Otlp.CompletenessHeartbeat`: after `Start()` it reports the
+  allocator's declaration on a `PeriodicTimer` over a `TimeProvider`, every 15 seconds by
+  default; `ReportAsync` sends one on demand. It acknowledges the held Filter epoch (0
+  before the first Event Filter), sends one signal at a time, and restates the previous
+  signal when nothing has changed. `CompletenessSignals.Build` builds a signal.
 
-## Remote parents that are not Probes
+**`complete_through` never runs ahead of the evidence.** It advances only across a
+contiguous run of successful exports. A failed export, an `Activity` that never ends or is
+never exported, and today an Event dropped for the Event Filter each hold it below that
+slot: the epoch stays open and the Verdicts that depend on this source stay Inconclusive
+instead of passing. The allocator does not retry. Re-export the identical Event and call
+`MarkExported(slot)`.
 
-A span whose remote parent comes from a caller that is not a Probe (a browser, curl, an
-uninstrumented service) carries a `traceparent` but no `sentinel.parent.event.id`. By default the
-export refuses it and its slot stays FAILED. With `AllowUnattributedRemoteParent = true`
-(`SpanConversion`, `SpanExport` and the processor options; default false, as in the Go SDK) it is
-exported as a causal **root**: no predecessor, and no parent span id on the Sentinel copy (the
-periphery refuses a parent span id without a parent Event id; this encoder never writes one). The
-host's own copy keeps its parent span for Tempo. Only a remote parent qualifies: a local parent
-without the id is still refused.
+**The epoch rolls after a declared close.** A signal whose `complete_through` equals
+`last_emitted` is a declared close, and Sentinel accepts nothing more in that epoch. The
+allocator seals it, and the next allocation opens a new epoch: the greater of the previous
+epoch plus one and the clock's Unix milliseconds. Expect a new Sequence Epoch after every
+quiet period. If Sentinel has not yet accepted the previous epoch's final declaration
+under the Filter epoch the Probe now acknowledges, the heartbeat restates it before the
+first signal of the new epoch.
 
-`ProbeActivities.StartEvent(source, name, kind, parent, parentEventId)` starts the Event activity.
-.NET parents to `Activity.Current` whatever context you pass, so the helper clears it around the
-start, then restores it. Without `parent` it uses the ambient activity: a Probe Event
-(`sentinel.event.id` tag) becomes a local parent with its id as `sentinel.parent.event.id`; any
-other ambient span (an inbound request span) becomes a remote parent without one.
+**A restarted process needs a strictly greater epoch.** By default the first epoch is the
+clock's Unix milliseconds. If your clock can step backwards across a restart, persist the
+last epoch and pass it to the next run's `SequenceAllocator` as the previous epoch: the
+allocator then starts at the greater of the clock and that epoch plus one, and refuses an
+explicit epoch that is not greater. Without it, a clock that stepped backwards yields an
+epoch that Sentinel refuses with HTTP 409.
 
-`ParentEventPropagation.InjectParentEventId(carrier, eventId)` writes the `x-sentinel-parent-event-id`
-header next to `traceparent`; `ExtractParentEventId(carrier)` reads it, falling back to the
-`sentinel` member of `tracestate` (`sentinel=<eventId>`). Dictionary carriers (case-insensitive),
-`HttpHeaders` and `Inject`/`Extract` with a getter/setter (ASP.NET `IHeaderDictionary`, Kafka headers) are supported.
-Pass the extracted id to `StartEvent` as `parentEventId`.
+**Idle sources.** `DeclareIdle()` reports the source as intentionally idle. The next
+allocation, or `DeclareActive()`, makes it active again.
 
-`Otlp.CompletenessHeartbeat` sends the allocator's declarations on `/v1/logs`:
+**`Stop()` and `ShutdownAsync()`.** `Stop()` cancels the schedule and sends nothing more:
+use it when the process must go silent. `ShutdownAsync()` waits for a running report and
+sends one final report, which is a declared close only if every slot was exported. On a
+clean exit, let your exports settle first, then call `ShutdownAsync()`.
 
-```csharp
-using var heartbeat = new CompletenessHeartbeat(
-    sequence,
-    (signal, ct) => exporter.ExportCompletenessAsync(sourceHandle, signal, ct),
-    filterEpoch: filterStore.Epoch);
-heartbeat.Start();
-```
+## Status
 
-The default interval is 15 seconds; `interval` accepts 1 s to 59.999 s or
-`TimeSpan.Zero` for `ReportAsync` only. `timeProvider` and `send` inject time,
-scheduling and transport. An absent Filter is acknowledged as epoch 0.
-`DeclareIdle()` declares intentional idle; the next allocation or `DeclareActive()`
-makes the source active again.
+- **Detect-only.** Sentinel ingests Events, evaluates Specifications and reports Verdicts.
+  It blocks nothing.
+- **Decide is not served.** Sentinel answers no decision requests today. When an enforcing
+  Specification selects an Event, the gate waits on the log receiver for a DecideResponse
+  for at most the request's remaining Transport Budget. No answer arrives, so when the
+  budget runs out the gate resolves by its fail mode: `OutcomeKind.FailClosedDeny` when one
+  of those Specifications is fail-closed and your deployment accepted that,
+  `OutcomeKind.FailOpenPermit` otherwise. Cancelling the token you pass to
+  `Gate.GateAsync` ends the wait sooner, with the same fail mode.
+- **One wire.** OTLP/HTTP protobuf, as described above, is the only Probe wire.
+- **Unversioned.** There is no release yet, and no compatibility guarantee before one: the
+  API and the wire may still change. A `0.1.0` package manifest is not a release.
 
-`last_emitted` is the highest allocated number; `complete_through` advances only over
-the contiguous successfully exported prefix. In-flight, failed and Filter-dropped
-slots keep the boundary open, preserving Inconclusive instead of inventing evidence.
-Filtered ranges retain the Filter epoch for #542, but are not yet declared on the
-wire and do not advance completeness. The allocator does not retry exports.
+A Specification with no blocking budget or a zero budget resolves by fail mode at once.
 
-Equal counters declare an epoch closed. The allocator seals it, and the next
-allocation opens `max(previous epoch + 1, current Unix milliseconds)`. The heartbeat
-restates the previous epoch's final declaration before the new one until accepted
-under the current Filter epoch. Only the epoch current at Filter publication can
-settle Authoritative; Events straddling a source's epoch roll may leave their Binding
-Inconclusive.
+## Contributing
 
-A restart needs a strictly greater epoch. Unix milliseconds are the default; if the
-clock can step backwards, persist the last epoch and pass `previousEpoch` to the
-allocator. A clock-derived epoch then advances past it, while an explicit `epoch`
-that is not greater is refused. Without persistence Sentinel refuses a regression
-with HTTP 409.
+See [CONTRIBUTING.md](CONTRIBUTING.md). This repository is a published mirror; pull
+requests are reviewed and re-landed upstream.
 
-`Stop()` cancels scheduling and sends nothing further. `ShutdownAsync()` waits for
-a running report and sends a final declaration, which closes only if every allocated
-slot was exported. Let exports settle before `ShutdownAsync()` on a clean exit;
-`Dispose()` silences the heartbeat without a final send.
+## License
 
-## Generated proto types
+[MPL-2.0](LICENSE)
 
-The C# proto types under `src/Sentinel.Probe.Sdk/gen/` are protoc-gen-csharp output
-from the BSR remote plugin `buf.build/protocolbuffers/csharp:v33.4`, which targets the
-pinned `Google.Protobuf` 3.33.4 runtime (#466). The tree is **gitignored**, like the Go,
-Python, JVM and Elixir SDK trees. `tools/generate-dotnet-sdk.sh` regenerates it from
-`proto/` through `buf.gen.dotnet.yaml`, and every Justfile .NET recipe reaches it through
-`_sdk-dotnet-restore`. A content digest (`gen/.proto-digest`) makes the step a no-op until
-a proto or the template changes; a cold tree costs one remote-plugin call.
+## Development environment (this mirror): Devbox + just
 
-`buf.gen.dotnet.yaml` copies the root template's `managed:` block verbatim, so this tree is
-byte-identical to the root template's `.generated/dotnet`.
-`tools/check-dotnet-template-parity.sh` checks the templates on every pull request, and
-`just _generated-check` compares the trees (`sdk-drift:sdk/dotnet`).
+This repository pins its own toolchain — `devbox.json` + `devbox.lock` — and every task
+runs inside it, the same convention as the Sentinel source repository:
 
-The generated API, for readers of the code:
+    devbox install        # once; resolves devbox.lock
+    devbox shell          # then `just --list` for the recipes
 
-- enum members drop their type prefix (`DecisionAction.Permit`);
-- the `AttributeValue` oneof is read through `ValueCase`, and setting an arm sets the case;
-- proto3 `optional` fields are a plain value plus `HasX` and `ClearX()`. Reading `X` on an
-  absent field yields 0, and C# widens that into a `ulong?` without a diagnostic, so the
-  SDK never reads `X` without its `HasX`: either through the `Proto/Presence.cs` helpers,
-  which return null for absent, or directly behind an explicit `HasX` check (the gate reads
-  `EventFilter.Epoch` that way). Epoch 0 is a real epoch;
-- repeated fields are get-only `RepeatedField<T>`; parse with `X.Parser.ParseFrom`.
+`build`, `test`, `lint` and `fmt-check` reuse the canonical gate names of the source
+repository, scoped to this one language.
 
-## Build and test
-
-Run `just harness-probe-sdk-dotnet` (it generates, restores, builds and tests). By hand,
-generate first, because a fresh checkout has no `gen/`:
-
-```
-tools/generate-dotnet-sdk.sh
-cd sdk/dotnet
-dotnet restore --locked-mode Sentinel.Probe.Sdk.sln
-dotnet build --no-restore Sentinel.Probe.Sdk.sln
-dotnet test --no-build --no-restore Sentinel.Probe.Sdk.sln
-```
-
-Run the `dotnet` commands from `sdk/dotnet` so SDK discovery uses its `global.json`. All
-three pass on .NET 10.0.302. The test suite uses xUnit, is hermetic at test-execution time
-(ADR-0019: no network, no wall clock), and covers 310 cases mirroring the Go `*_test.go`
-files plus the generated-API presence regressions.
-
-## Key design decisions
-
-- **`Activity.TagObjects`** (S1 fix): span→event conversion reads `Activity.TagObjects`
-  rather than `Activity.Tags` so all attribute types round-trip.
-- **`System.Numerics.BigInteger`** for Int128: the proto `Int128` (two `int64` words)
-  is decoded into `BigInteger` via the `Int128Codec` helper, avoiding any external
-  dependency.
-- **OTLP/HTTP protobuf**: traces and completeness are posted by `OtlpExporter`.
-  The compiled Connect client remains for codec tests and is not the gate's path.
-- **`ProbeSpanProcessor : BaseProcessor<Activity>`**: the OTel span processor hooks
-  `OnEnd` to convert and emit events, with `Activity.TagObjects` for tag access.
-- **Pinned NuGet versions**: all package references pin exact versions
-  (`Google.Protobuf` 3.33.4, `OpenTelemetry`/`OpenTelemetry.Api` 1.17.0, `xunit`
-  2.9.3, `xunit.runner.visualstudio` 3.1.5, `Microsoft.NET.Test.Sdk` 18.8.1).
-- **`RestorePackagesWithLockFile=true`**: `packages.lock.json` files are committed
-  per project for reproducible restores, analogous to `go.sum`.
-- **Generated code builds under `TreatWarningsAsErrors`** with no exemption:
-  protoc-gen-csharp marks every file `// <auto-generated>` (nullable context off,
-  analyzers skip it) and emits its own `#pragma warning disable` lines.
+The toolchain is tested with Devbox 0.19.0. Devbox release installs are a launcher that
+runs `DEVBOX_USE_VERSION` when it is set, so `export DEVBOX_USE_VERSION=0.19.0` keeps you
+on the tested version.
